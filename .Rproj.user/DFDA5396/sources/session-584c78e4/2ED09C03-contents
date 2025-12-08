@@ -1,0 +1,266 @@
+#//////////////////////////////////////////////////////////////////////////////#
+# 
+# TITLE: Opportunity Zones — Post 2018
+# SUBTITLE: ACS total housing (2019–2023) vs HPD affordable completions (2018–2023)
+# BY:    Paul Lee & Charles Nkurunziza
+# DATE:  Dec 4, 2025
+#
+# FIGURES:
+#   A. Facet with:
+#      1. Top 5 OZ tracts — stacked bars (Affordable vs Other in total housing)
+#      2. Bottom 5 OZ tracts — stacked bars (exclude tiny special tracts)
+#      3. High total + low affordable 5 OZ tracts — stacked bars (≥ top 10% stock & ≤25% share)
+#   B. Scatter (all OZ tracts): total stock vs affordable units, 25% cutoff
+#
+# INPUTS:
+#   - designated-qozs.12.14.18.csv
+#   - Affordable_Housing_Production_by_Building.csv
+#
+#//////////////////////////////////////////////////////////////////////////////#
+
+#------------------------------- PRE-ANALYSIS ---------------------------------#
+library(tidyverse)
+library(janitor)
+library(scales)
+library(tidycensus)
+library(lubridate)
+library(stringr)
+
+#------------------------------- COLOR PALETTE --------------------------------#
+deep_blue     <- "#0B3C6D"   # affordable stack fill
+mid_blue      <- "#4379C3"   # highlight color (> cutoff in scatter)
+light_blue    <- "#6FA3E6"
+grey_fill     <- "#BFBFBF"   # other (ACS total minus HPD)
+grey_line     <- "grey60"
+grey_text     <- "grey40"
+accent_red    <- "#D84A4A"   # <25% dots in scatter
+label_white   <- "white"
+
+fig_w <- 11; fig_h <- 6.5; fig_dpi <- 300
+
+# Thresholds / cutoffs
+min_units_threshold <- 10
+aff_share_cutoff    <- 0.25
+hu_floor_bottom     <- 500
+hi_total_quantile   <- 0.90
+
+#------------------------------ LOAD OZ LIST ----------------------------------#
+oz_raw <- read_csv("designated-qozs.12.14.18.csv", show_col_types = FALSE) %>% clean_names()
+
+oz_nyc <- oz_raw %>%
+  transmute(geoid = as.character(`census_tract_number`),
+            is_oz = 1L)
+
+#------------------------------ LOAD HPD CSV ----------------------------------#
+hpd <- read_csv(
+  "Affordable_Housing_Production_by_Building.csv",
+  col_types = cols(
+    `Project Start Date`       = col_date("%m/%d/%Y"),
+    `Project Completion Date`  = col_date("%m/%d/%Y"),
+    `Building Completion Date` = col_date("%m/%d/%Y")
+  ),
+  show_col_types = FALSE
+) %>% clean_names()
+
+#-------------------------- BOROUGH - COUNTY FIPS -----------------------------#
+county_fips <- c(
+  "Bronx"         = "005",
+  "Brooklyn"      = "047",  # Kings
+  "Manhattan"     = "061",  # New York
+  "Queens"        = "081",
+  "Staten Island" = "085"   # Richmond
+)
+
+#--------------------------- MAKE 11-DIGIT GEOID ------------------------------#
+hpd <- hpd %>%
+  mutate(
+    county  = county_fips[as.character(borough)],
+    ct4     = str_pad(str_extract(as.character(census_tract), "\\d+"), 4, "left", "0"),
+    tract6  = if_else(is.na(ct4), NA_character_, paste0(ct4, "00")),
+    geoid   = if_else(!is.na(county) & !is.na(tract6), paste0("36", county, tract6), NA_character_)
+  ) %>%
+  filter(!is.na(geoid))
+
+#--------------------------- BUILD HPD TRACT TOTALS ---------------------------#
+# Post window: 2018–2023 building completions.
+hpd_tract <- hpd %>%
+  mutate(
+    year_c       = year(building_completion_date),
+    total_units  = replace_na(total_units, 0)
+  ) %>%
+  filter(!is.na(year_c), year_c >= 2018, year_c <= 2023) %>%
+  group_by(geoid) %>%
+  summarise(
+    aff_units_post = sum(total_units, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+#------------------------------- ACS: TOTAL HOUSING ---------------------------#
+census_api_key("6a00d29884accc02aadc0242607ee52f88d6e504", install = FALSE)
+
+acs_post <- get_acs(
+  geography   = "tract",
+  state       = "NY",
+  year        = 2023,
+  survey      = "acs5",
+  variables   = c(hu = "B25001_001"),
+  cache_table = TRUE
+) %>%
+  clean_names() %>%
+  transmute(geoid, hu_post = estimate) %>%
+  filter(!is.na(hu_post))
+
+#----------------------------------- JOIN -------------------------------------#
+df <- acs_post %>%
+  left_join(hpd_tract, by = "geoid") %>%
+  left_join(oz_nyc,    by = "geoid") %>%
+  mutate(
+    is_oz            = replace_na(is_oz, 0L),
+    aff_units_post   = replace_na(aff_units_post, 0),
+    other_units_post = pmax(hu_post - aff_units_post, 0),
+    aff_share_post   = if_else(hu_post > 0, aff_units_post / hu_post, NA_real_)
+  )
+
+#----------------------------- SELECT 3 OZ GROUPS -----------------------------#
+top5_oz <- df %>%
+  filter(is_oz == 1L) %>%
+  arrange(desc(hu_post)) %>%
+  slice_head(n = 5) %>%
+  mutate(group = "Top 5 OZs (by units)")
+
+bottom5_oz <- df %>%
+  filter(is_oz == 1L, hu_post >= hu_floor_bottom) %>%
+  arrange(hu_post) %>%
+  slice_head(n = 5) %>%
+  mutate(group = "Bottom 5 OZs (by units)")
+
+hi_cut <- quantile(df$hu_post[df$is_oz == 1L], probs = hi_total_quantile, na.rm = TRUE)
+
+hi_total_low_aff_5 <- df %>%
+  filter(is_oz == 1L, hu_post >= hi_cut, !is.na(aff_share_post), aff_share_post <= aff_share_cutoff) %>%
+  arrange(desc(hu_post)) %>%
+  slice_head(n = 5) %>%
+  mutate(group = "High stock & ≤25% affordable")
+
+sel_oz <- bind_rows(top5_oz, bottom5_oz, hi_total_low_aff_5) %>%
+  # facet order: Top 5, Bottom 5 and High stock/low affordable
+  mutate(group = factor(group, levels = c(
+    "Top 5 OZs (by units)",
+    "Bottom 5 OZs (by units)",
+    "High stock & ≤25% affordable"
+  )))
+
+#------------------------------ STACKED BAR DATA ------------------------------#
+bars <- sel_oz %>%
+  select(geoid, group, hu_post, aff_units_post, other_units_post) %>%
+  pivot_longer(
+    c(aff_units_post, other_units_post),
+    names_to = "bucket", values_to = "units"
+  ) %>%
+  mutate(
+    bucket = recode(bucket,
+                    aff_units_post   = "Affordable (HPD 2018–2023)",
+                    other_units_post = "Other (ACS total − HPD)"),
+    geoid = forcats::fct_reorder2(geoid, hu_post, units, .fun = function(h, u) max(h, na.rm = TRUE)),
+    pct_label = case_when(
+      bucket == "Affordable (HPD 2018–2023)" & (units <= 0 | is.na(units)) ~ "",
+      TRUE ~ scales::percent(units / hu_post, accuracy = 1)
+    )
+  )
+
+# totals (top-of-bar labels)
+bars_totals <- sel_oz %>%
+  distinct(geoid, group, hu_post)
+
+#-------------------------------- OZ FACET FIGURE -----------------------------#
+# one row per bar per panel (for x-axis labels inside each facet)
+xlabels_per_panel <- bars %>%
+  distinct(group, geoid, hu_post)
+
+fig_facets <- ggplot(bars, aes(x = geoid, y = units, fill = bucket)) +
+  # stack
+  geom_col(width = 0.88, position = position_stack(reverse = TRUE)) +
+  # percent labels inside each segment (hide 0% affordable)
+  geom_text(aes(label = pct_label),
+            position = position_stack(vjust = 0.5, reverse = TRUE),
+            color = label_white, size = 3.6, fontface = "bold") +
+  # totals on top of each bar
+  geom_text(data = bars_totals,
+            aes(x = geoid, y = hu_post, label = scales::comma(hu_post)),
+            inherit.aes = FALSE, vjust = -0.35, size = 3.2, color = grey_text) +
+  # Per-panel "x-axis" labelS
+geom_text(data = xlabels_per_panel,
+          aes(x = geoid, y = 0, label = geoid),
+          inherit.aes = FALSE, vjust = 1.6, size = 3.1, color = grey_text) +
+
+  scale_fill_manual(
+  values = c("Affordable (HPD 2018–2023)" = deep_blue,
+             "Other (ACS total − HPD)"    = grey_fill),
+  breaks = c("Affordable (HPD 2018–2023)", "Other (ACS total − HPD)"),
+  name   = NULL
+) +
+  scale_y_continuous(labels = scales::comma, expand = expansion(mult = c(0.06, 0.08))) +
+  labs(
+    title    = "Grouped OZ Tracts: Total Housing vs  Affordable Housing",
+    subtitle = "Stacked bars by tract (panels: Top 5 Total Housing, Bottom 5 Total Housing, and High Total Housing & ≤25% Affordable Housing).",
+    x = "Census tract",
+    y = "Housing Units",
+    caption  = "Sources: ACS 2019–2023 (B25001); HPD Affordable Housing Production by Building; CDFI OZ tract list."
+  ) +
+  facet_wrap(~ group, ncol = 1, scales = "fixed") +
+  coord_cartesian(clip = "off") +                     # lets the fake x-labels sit just below 0
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title    = element_text(hjust = 0.5, face = "bold", color = deep_blue,
+                                 size = 16, margin = margin(b = 6)),
+    plot.subtitle = element_text(hjust = 0.5, size = 11, margin = margin(b = 10)),
+    plot.title.position = "plot",
+    axis.text.x   = element_blank(),                  # hide the real axis text
+    axis.ticks.x  = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    plot.margin = margin(t = 10, r = 20, b = 24, l = 20)  # a little space for labels
+  )
+
+ggsave("fig_OZ_facets_affordable_bottom.png",
+       fig_facets, width = 14, height = 10, dpi = fig_dpi, bg = "white")
+
+#----------------------------- OZ SCATTER FIGURE ------------------------------#
+lab_lo <- paste0("< ", scales::percent(aff_share_cutoff))
+lab_hi <- paste0("≥ ", scales::percent(aff_share_cutoff))
+
+scatter_df <- df %>%
+  filter(is_oz == 1L) %>%
+  mutate(color_group = if_else(!is.na(aff_share_post) & aff_share_post < aff_share_cutoff,
+                               lab_lo, lab_hi))
+
+fig_scatter <- ggplot(scatter_df, aes(x = hu_post, y = aff_units_post, color = color_group)) +
+  geom_hline(yintercept = 0, color = "grey85") +
+  geom_vline(xintercept = 0, color = "grey85") +
+  geom_point(size = 2.2, alpha = 0.9) +
+  scale_color_manual(
+    values = setNames(c(accent_red, mid_blue), c(lab_lo, lab_hi)),
+    name   = paste0("Affordable share vs ", scales::percent(aff_share_cutoff))
+  ) +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title    = "Selected OZ Tracts: Total Housing vs Affordable Housing",
+    subtitle = "Color shows whether affordable share meets a 25% cutoff.",
+    x = "Total housing units",
+    y = "Affordable housing units",
+    caption  = "ACS includes all housing; HPD counts recorded affordable completions."
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title    = element_text(hjust = 0.5, face = "bold", color = deep_blue,
+                                 size = 16, margin = margin(b = 6)),
+    plot.subtitle = element_text(hjust = 0.5, size = 11, margin = margin(b = 10)),
+    plot.title.position = "plot"
+  )
+
+ggsave("fig_OZ_scatter_aff_share_25.png", fig_scatter,
+       width = fig_w, height = fig_h, dpi = fig_dpi, bg = "white")
+
+
+#------------------------------- END OF FILE ----------------------------------#

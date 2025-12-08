@@ -1,0 +1,51 @@
+#//////////////////////////////////////////////////////////////////////////////#
+# Prep for HPD (CSV) → add 11-digit tract GEOID
+# GEOID = state(36) + county(FIPS via borough) + tract(4-digit base + "00")
+#//////////////////////////////////////////////////////////////////////////////#
+
+library(tidyverse)
+library(janitor)
+library(stringr)
+library(lubridate)
+
+#------------------------------ LOAD HPD DATA ---------------------------------#
+hpd <- read_csv(
+  "Affordable_Housing_Production_by_Building.csv",
+  col_types = cols(
+    `Project Start Date`       = col_date(format = "%m/%d/%Y"),
+    `Project Completion Date`  = col_date(format = "%m/%d/%Y"),
+    `Building Completion Date` = col_date(format = "%m/%d/%Y")
+  )
+) %>% clean_names()
+
+#-------------------------- BOROUGH → COUNTY FIPS -----------------------------#
+county_fips <- c(
+  "Bronx"         = "005",
+  "Brooklyn"      = "047",  # Kings
+  "Manhattan"     = "061",  # New York
+  "Queens"        = "081",
+  "Staten Island" = "085"   # Richmond
+)
+
+#--------------------------- MAKE 11-DIGIT GEOID ------------------------------#
+# No intermediate columns; compute everything inline and keep full table.
+hpd <- hpd %>%
+  mutate(
+    geoid = if_else(
+      !is.na(borough) & !is.na(census_tract),
+      paste0(
+        "36",
+        county_fips[as.character(borough)],
+        # tract6 = left-pad 4-digit base + "00" (no decimal suffix in your file)
+        paste0(
+          str_pad(str_extract(as.character(census_tract), "\\d+"),
+                  width = 4, side = "left", pad = "0"),
+          "00"
+        )
+      ),
+      NA_character_
+    )
+  )
+
+# If you want to save the enriched HPD table:
+# write_csv(hpd, "hpd_buildings_clean.csv")

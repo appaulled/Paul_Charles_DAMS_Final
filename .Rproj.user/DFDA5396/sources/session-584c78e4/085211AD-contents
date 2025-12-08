@@ -1,0 +1,228 @@
+#//////////////////////////////////////////////////////////////////////////////#
+# 
+# TITLE: OZ triage with HPD + ACS (NYC-only, tract6 matching)
+# SUBTITLE: Top/Bottom OZ tracts and High-Dev/Low-Deep picks using CSVs only
+# BY:    Charles Nkurunziza
+# DATE:  Dec 04, 2025
+#
+# WHAT THIS SCRIPT DOES
+#   - Reads two local CSVs:
+#       1) designated-qozs.12.14.18.csv  (NYC OZ list; has a tract-number column)
+#       2) Affordable_Housing_Production_by_Building.csv (HPD buildings)
+#   - Creates a 6-character tract code 'tract6' in both files:
+#       tract6 = left-pad tract to 4 digits + "00"  (e.g., 7 -> "000700")
+#   - Pulls ACS 2019–2023 tract-level Median Contract Rent (B25058_001),
+#     derives tract6 from ACS GEOID via substr(geoid, 6, 11) and joins on tract6
+#   - Aggregates HPD by tract: total units, deep units (ELI+VLI), deep share
+#   - Selects 3 OZ groups:
+#       (1) Top 3 OZ tracts by total units
+#       (2) Bottom 3 OZ tracts by total units (incl. zeros)
+#       (3) 3 OZ tracts with high development but low deep share
+#   - Exports three figures (PNG)
+#
+# ASSUMPTIONS (explicit):
+#   * NYC-only workflow; we assume tract numbers do NOT collide across boroughs.
+#   * OZ CSV contains a column with the tract number (no county needed).
+#   * “Median Asking Rent” isn’t in ACS; we use Median Contract Rent (B25058_001).
+#
+#//////////////////////////////////////////////////////////////////////////////#
+
+#------------------------------- PRE-ANALYSIS ---------------------------------#
+library(tidyverse)
+library(janitor)
+library(scales)
+library(lubridate)
+library(stringr)
+library(tidycensus)
+
+deep_blue   <- "#0B3C6D"
+light_blue  <- "#6FA3E6"
+grey_fill   <- "#BFBFBF"
+label_white <- "white"
+
+fig_w  <- 11
+fig_h  <- 6.5
+fig_dpi <- 300
+
+title_style <- theme(
+  plot.title    = element_text(hjust = 0.5, face = "bold", color = deep_blue,
+                               size = 16, margin = margin(b = 6)),
+  plot.subtitle = element_text(hjust = 0.5, size = 11, margin = margin(b = 10)),
+  plot.title.position = "plot"
+)
+
+#------------------------------- FILE PATHS -----------------------------------#
+oz_csv  <- "designated-qozs.12.14.18.csv"
+hpd_csv <- "Affordable_Housing_Production_by_Building.csv"
+
+#------------------------------ LOAD HPD DATA ---------------------------------#
+# Minimal parse: dates + unit buckets; create tract6 from census_tract
+hpd <- read_csv(
+  hpd_csv,
+  col_types = cols(
+    `Project Start Date`       = col_date(format = "%m/%d/%Y"),
+    `Project Completion Date`  = col_date(format = "%m/%d/%Y"),
+    `Building Completion Date` = col_date(format = "%m/%d/%Y")
+  )
+) %>% 
+  clean_names() %>%
+  mutate(
+    # tract6: pad tract to 4 digits, then add "00" (NYC-only assumption)
+    tract6 = if_else(
+      !is.na(census_tract),
+      paste0(
+        str_pad(str_extract(as.character(census_tract), "\\d+"),
+                width = 4, side = "left", pad = "0"),
+        "00"
+      ),
+      NA_character_
+    ),
+    # unit buckets
+    eli         = replace_na(extremely_low_income_units, 0),
+    vli         = replace_na(very_low_income_units, 0),
+    low         = replace_na(low_income_units, 0),
+    mod         = replace_na(moderate_income_units, 0),
+    mid         = replace_na(middle_income_units, 0),
+    oth         = replace_na(other_income_units, 0),
+    total_units = replace_na(total_units, 0),
+    year        = year(project_start_date)
+  )
+
+#------------------------------- LOAD OZ CSV ----------------------------------#
+# Rename the tract-number column if needed; then build tract6 the same way
+oz <- read_csv(oz_csv, show_col_types = FALSE) %>%
+  clean_names() %>%
+  rename(tract_number = any_of(c("census_tract_number","census_tract","tract","tracts"))) %>%
+  mutate(
+    tract6 = paste0(
+      str_pad(str_extract(as.character(tract_number), "\\d+"),
+              width = 4, side = "left", pad = "0"),
+      "00"
+    )
+  ) %>%
+  distinct(tract6) %>%
+  mutate(is_oz = TRUE)
+
+#------------------------------ ACS: MEDIAN RENT -------------------------------#
+# ACS 2019–2023, tract-level Median Contract Rent (B25058_001), NY state only
+# Derive tract6 from GEOID via substr(geoid, 6, 11)
+acs_year <- 2023
+median_rent <- get_acs(
+  geography = "tract",
+  state     = "NY",
+  year      = acs_year,
+  survey    = "acs5",
+  variables = c(med_contract_rent = "B25058_001"),
+  cache_table = TRUE,
+  output = "wide"
+) %>%
+  clean_names() %>%
+  transmute(
+    geoid,
+    tract6 = substr(geoid, 6, 11),
+    med_contract_rent = med_contract_rent_e
+  )
+
+#-------------------------- FLAG OZ + BUILD TRACT SUMS ------------------------#
+hpd_flagged <- hpd %>%
+  left_join(oz, by = "tract6") %>%
+  mutate(is_oz = replace_na(is_oz, FALSE))
+
+tract_sums <- hpd_flagged %>%
+  filter(!is.na(tract6), !is.na(year), year >= 2014) %>%
+  group_by(tract6, is_oz) %>%
+  summarise(
+    units_total = sum(total_units, na.rm = TRUE),
+    units_deep  = sum(eli + vli, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    deep_share = if_else(units_total > 0, units_deep / units_total, NA_real_)
+  ) %>%
+  left_join(median_rent, by = "tract6")
+
+#----------------------- SELECT ONLY OZ TRACTS FOR RANKS ----------------------#
+oz_tracts <- tract_sums %>% filter(is_oz)
+
+# 1) Top 3 OZ tracts by total development
+top3_oz <- oz_tracts %>%
+  arrange(desc(units_total), tract6) %>%
+  slice_head(n = 3) %>%
+  mutate(group_tag = "Top 3 OZs by total units")
+
+# 2) Bottom 3 OZ tracts by total development (including zeros)
+bottom3_oz <- oz_tracts %>%
+  arrange(units_total, tract6) %>%
+  slice_head(n = 3) %>%
+  mutate(group_tag = "Bottom 3 OZs by total units")
+
+# 3) High development, low deep-share OZs:
+#    Take OZ tracts in bottom quartile of deep_share, then pick 3 with highest units_total
+low_share_cut <- quantile(oz_tracts$deep_share, probs = 0.25, na.rm = TRUE)
+
+hi_dev_low_deep_oz <- oz_tracts %>%
+  filter(!is.na(deep_share), deep_share <= low_share_cut) %>%
+  arrange(desc(units_total), tract6) %>%
+  slice_head(n = 3) %>%
+  mutate(group_tag = "High-dev, low-deep-share OZs (3)")
+
+oz_groups <- bind_rows(top3_oz, bottom3_oz, hi_dev_low_deep_oz)
+
+#------------------------------- FIGURE A -------------------------------------#
+fig_A <- ggplot(oz_groups,
+                aes(x = fct_reorder(tract6, units_total), y = units_total, fill = group_tag)) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title    = "OZ Tracts: Total HPD Units (Top 3, Bottom 3, and High-Dev/Low-Deep)",
+    subtitle = "HPD 2014–present (all construction types); NYC-only tract6 matching",
+    x = "Census tract (tract6)", y = "Total HPD units",
+    fill = "Group",
+    caption  = "HPD: Affordable Housing Production by Building; ACS 2019–2023 (B25058)."
+  ) +
+  theme_minimal(base_size = 12) + title_style +
+  theme(legend.position = "bottom")
+
+ggsave("fig_A_oz_units_total_groups.png", fig_A, width = fig_w, height = fig_h, dpi = fig_dpi, bg = "white")
+
+#------------------------------- FIGURE B -------------------------------------#
+fig_B <- ggplot(oz_groups,
+                aes(x = fct_reorder(tract6, deep_share, .fun = identity, .desc = TRUE),
+                    y = deep_share, fill = group_tag)) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title    = "OZ Tracts: Share of Deep Units (ELI+VLI / Total)",
+    subtitle = "Lower deep share indicates shallower affordability in the HPD mix",
+    x = "Census tract (tract6)", y = "Deep share of HPD units",
+    fill = "Group",
+    caption  = "Deep = Extremely + Very Low Income units."
+  ) +
+  theme_minimal(base_size = 12) + title_style +
+  theme(legend.position = "bottom")
+
+ggsave("fig_B_oz_deep_share_groups.png", fig_B, width = fig_w, height = fig_h, dpi = fig_dpi, bg = "white")
+
+#------------------------------- FIGURE C -------------------------------------#
+fig_C <- oz_groups %>%
+  ggplot(aes(x = fct_reorder(tract6, med_contract_rent), y = med_contract_rent, color = group_tag)) +
+  geom_segment(aes(xend = fct_reorder(tract6, med_contract_rent), y = 0, yend = med_contract_rent),
+               linewidth = 0.6, alpha = 0.6) +
+  geom_point(size = 3) +
+  coord_flip() +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title    = "OZ Tracts: Median Contract Rent (ACS 2019–2023)",
+    subtitle = "Context for rent levels in the selected OZ tracts",
+    x = "Census tract (tract6)", y = "Median contract rent",
+    color = "Group",
+    caption  = "Source: U.S. Census Bureau, ACS 5-year (2019–2023), B25058_001."
+  ) +
+  theme_minimal(base_size = 12) + title_style +
+  theme(legend.position = "bottom")
+
+ggsave("fig_C_oz_median_contract_rent_groups.png", fig_C, width = fig_w, height = fig_h, dpi = fig_dpi, bg = "white")
+
+#------------------------------- END OF FILE ----------------------------------#

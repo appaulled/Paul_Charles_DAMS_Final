@@ -1,0 +1,62 @@
+#//////////////////////////////////////////////////////////////////////////////#
+# Prep for OZ list (CSV) and HPD (CSV)
+#
+# INPUTS:
+#   - designated-qozs.12.14.18.csv
+#   - Affordable_Housing_Production_by_Building.csv
+#
+# OUTPUTS:
+#   - nyc_oz_tracts.csv
+#   - hpd_buildings_clean.csv 
+#
+#NOTE:
+#  Need to build 11-digit tract GEOID for HPD
+#  GEOID = state(36) + county(FIPS) + tract(4-digit base + "00")
+#  Examples: 7  → "0007" + "00" → "000700"
+#            123→ "0123" + "00" → "012300"
+#//////////////////////////////////////////////////////////////////////////////#
+
+library(tidyverse)
+library(janitor)
+library(stringr)
+library(lubridate)
+
+#------------------------------ LOAD HPD DATA ---------------------------------#
+hpd <- read_csv(
+  "Affordable_Housing_Production_by_Building.csv",
+  col_types = cols(
+    `Project Start Date`      = col_date(format = "%m/%d/%Y"),
+    `Project Completion Date` = col_date(format = "%m/%d/%Y"),
+    `Building Completion Date`= col_date(format = "%m/%d/%Y")
+  )
+) %>% clean_names()
+
+#-------------------------- BOROUGH → COUNTY FIPS -----------------------------#
+county_fips <- c(
+  "Bronx"         = "005",
+  "Brooklyn"      = "047",  # Kings
+  "Manhattan"     = "061",  # New York
+  "Queens"        = "081",
+  "Staten Island" = "085"   # Richmond
+)
+
+#--------------------------- MAKE 11-DIGIT GEOID ------------------------------#
+hpd <- hpd %>%
+  mutate(
+    borough = as.character(borough),
+    county  = county_fips[borough],
+    
+    # Keep only digits, add leading zeroes to make them 4-character long,
+    # then append "00" to make a 6-char tract code.
+    ct_raw       = as.character(census_tract),
+    ct_digits    = str_extract(ct_raw, "\\d+"),              # e.g., "7" → "7"
+    tract_base4  = if_else(is.na(ct_digits), NA_character_,
+                           str_pad(ct_digits, width = 4, side = "left", pad = "0")),
+    tract6       = if_else(is.na(tract_base4), NA_character_, paste0(tract_base4, "00")),
+    
+    # Full GEOID: "36" + county FIPS + 6-char tract
+    geoid        = if_else(!is.na(county) & !is.na(tract6),
+                           paste0("36", county, tract6),
+                           NA_character_)
+  )
+

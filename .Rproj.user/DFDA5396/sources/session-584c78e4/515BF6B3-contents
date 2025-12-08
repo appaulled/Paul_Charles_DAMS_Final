@@ -1,0 +1,544 @@
+#//////////////////////////////////////////////////////////////////////////////#
+# 
+# TITLE: Who Benefits from “Affordable” Housing in NYC?
+# SUBTITLE: What HPD’s 2014–Present Data Reveals About Deep Affordability
+# BY:    Charles Nkurunziza
+# DATE:  Oct 12, 2025
+#
+# FIGURES:
+#   1. Total HPD-Recorded Units Since 2014 (New Construction), by Borough
+#   2. Share of Units Affordable to Households ≤50% of AMI (New Construction), by Borough
+#   3. Rent-Burdened Households vs Deeply Affordable Units (New Construction), by Borough
+#   4. New Construction vs Preservation, by Borough (Totals with % Mix inside each bar)
+#   5. Affordable Housing Units per Year by Construction Type, by Borough
+#
+# DATA:
+#   - NYC Open Data: Affordable Housing Production by Building (CSV downloaded)
+#     file: "Affordable_Housing_Production_by_Building.csv"
+#   - U.S. Census Bureau ACS 5-year (Table B25070) via tidycensus
+#     (represents 2017–2021 for year=2021)
+#
+#//////////////////////////////////////////////////////////////////////////////#
+
+#------------------------------- PRE-ANALYSIS ---------------------------------#
+library(tidyverse)
+library(janitor)
+library(scales)
+library(tidycensus)
+library(lubridate)
+library(forcats)
+
+# Borough order used across all figures
+borough_levels <- c("Bronx","Brooklyn","Manhattan","Queens","Staten Island")
+
+# Brand colors and sizes
+deep_blue    <- "#0B3C6D"  # titles + ELI (New Construction)
+mid_blue     <- "#4379C3"  # VLI (New Construction)
+light_blue   <- "#6FA3E6"  # general bars/points
+grey_fill    <- "#BFBFBF"  # >50% AMI
+nc_blue      <- "#2F5FA8"  # new construction line/outline
+pres_green   <- "#3B8F6A"  # preservation line/outline
+pres_green_lt<- "#6DBB9A"  # lighter green for VLI (Preservation)
+label_white  <- "white"
+
+# Figure size and resolution used everywhere
+fig_w  <- 11
+fig_h  <- 6.5
+fig_dpi <- 300
+
+# Common title styling (avoid cut-off; center; add margins)
+title_style <- theme(
+  plot.title    = element_text(hjust = 0.5, face = "bold", color = deep_blue,
+                               size = 16, margin = margin(b = 6)),
+  plot.subtitle = element_text(hjust = 0.5, size = 11, margin = margin(b = 10)),
+  plot.title.position = "plot"
+)
+
+#------------------------------ LOAD HPD DATA ---------------------------------#
+# Source: NYC Open Data — HPD Affordable Housing Production by Building
+# https://data.cityofnewyork.us/Housing-Development/Affordable-Housing-Production-by-Building/hg8x-zxpr/about_data
+
+aff_housing <- read_csv(
+  "Affordable_Housing_Production_by_Building.csv",
+  col_types = cols(`Project Start Date` = col_date(format = "%m/%d/%Y"))
+) %>% clean_names()
+
+# Reusable variables used in multiple figures (define ONCE)
+aff_housing <- aff_housing %>%
+  mutate(
+    borough = factor(borough, levels = borough_levels),
+    total_units = replace_na(total_units, 0),
+    construction_type = reporting_construction_type,
+    project_start_date = project_start_date,                  # already Date
+    year = year(project_start_date),
+    eli = replace_na(extremely_low_income_units, 0),
+    vli = replace_na(very_low_income_units, 0),
+    low = replace_na(low_income_units, 0),
+    mod = replace_na(moderate_income_units, 0),
+    mid = replace_na(middle_income_units, 0),
+    oth = replace_na(other_income_units, 0)
+  )
+
+# Keep 2014+ everywhere
+aff_housing <- aff_housing %>% filter(year >= 2014)
+
+#//////////////////////////////////////////////////////////////////////////////#
+#
+# FIGURE 1. Total HPD-Recorded Units Since 2014 (New Construction), by Borough
+#
+#//////////////////////////////////////////////////////////////////////////////#
+
+#------------------------------ PREPARE DATA ----------------------------------#
+nc_totals <- aff_housing %>%
+  filter(construction_type == "New Construction") %>%
+  group_by(borough) %>%
+  summarise(units = sum(total_units, na.rm = TRUE), .groups = "drop")
+
+#------------------------------- CREATE FIGURE --------------------------------#
+fig_01 <- ggplot(nc_totals, aes(x = borough, y = units)) +
+  geom_col(fill = light_blue, width = 0.7) +
+  geom_text(aes(label = comma(units)), vjust = -0.4, size = 4.2) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.08))) +
+  labs(
+    title    = "Figure 1. Total HPD-Recorded Units Since 2014 (New Construction), by Borough",
+    x = "", y = "Number of units",
+    caption  = "Source: NYC Open Data — HPD Affordable Housing Production by Building. Last updated: August 28, 2025."
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    plot.margin = margin(10, 20, 10, 20)
+  ) + title_style
+
+#------------------------------- SAVE FIGURE ----------------------------------#
+ggsave("fig_01_total_units_new_by_borough.png", fig_01, width = fig_w, height = fig_h, dpi = fig_dpi, bg = "white")
+
+
+#//////////////////////////////////////////////////////////////////////////////#
+#
+# FIGURE 2. Share of Units Affordable to Households ≤50% of AMI (New Construction), by Borough
+# New Construction only; stacks show ELI (≤30%), VLI (31–50%), and >50% AMI.
+#
+#//////////////////////////////////////////////////////////////////////////////#
+
+#------------------------------ PREPARE DATA ----------------------------------#
+# Bottom→top stack order we want: ELI (deep_blue), VLI (mid_blue), Other (grey).
+income_levels <- c("Extremely Low Income (≤30% AMI)",
+                   "Very Low Income (31–50% AMI)",
+                   "Other (>50% AMI)")
+
+nc_share <- aff_housing %>%
+  filter(construction_type == "New Construction") %>%
+  group_by(borough) %>%
+  summarise(
+    units_eli = sum(eli, na.rm = TRUE),
+    units_vli = sum(vli, na.rm = TRUE),
+    units_oth = sum(low + mod + mid + oth, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    c(units_eli, units_vli, units_oth),
+    names_to = "bucket",
+    values_to = "units"
+  ) %>%
+  mutate(
+    income_bucket = case_when(
+      bucket == "units_eli" ~ "Extremely Low Income (≤30% AMI)",
+      bucket == "units_vli" ~ "Very Low Income (31–50% AMI)",
+      TRUE                  ~ "Other (>50% AMI)"
+    ),
+    income_bucket = factor(income_bucket, levels = income_levels)  # controls stack order (bottom→top)
+  ) %>%
+  group_by(borough) %>%
+  mutate(
+    boro_total = sum(units, na.rm = TRUE),
+    share = ifelse(boro_total > 0, units / boro_total, 0)
+  )
+
+#------------------------------- CREATE FIGURE --------------------------------#
+fig_02 <- ggplot(nc_share, aes(x = borough, y = share, fill = income_bucket)) +
+  geom_col(width = 0.72, position = position_stack(reverse = TRUE)) +
+  geom_text(
+    aes(label = paste0(round(100 * share), "%")),
+    position = position_stack(vjust = 0.5, reverse = TRUE),
+    color = label_white, size = 4.0, fontface = "bold"
+  ) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_manual(
+    values = c(
+      "Extremely Low Income (≤30% AMI)" = deep_blue,
+      "Very Low Income (31–50% AMI)"    = mid_blue,
+      "Other (>50% AMI)"                = grey_fill
+    ),
+    breaks = income_levels,                 # ensures legend order
+    name   = "Income Level (by AMI)"
+  ) +
+  labs(
+    title    = "Figure 2. Share of Units Affordable to Households ≤50% of AMI, by Borough",
+    subtitle = "New Construction only; stacks show ELI (≤30%), VLI (31–50%), and >50% AMI.",
+    x = "", y = "Share of units",
+    caption  = "Source: NYC Open Data — HPD Affordable Housing Production by Building. Last updated: August 28, 2025."
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    plot.margin = margin(10, 20, 10, 20),
+    legend.position = "right"
+  ) + title_style
+
+#------------------------------- SAVE FIGURE ----------------------------------#
+ggsave("fig_02_share_deep_new_by_borough.png", fig_02, width = fig_w, height = fig_h, dpi = fig_dpi, bg = "white")
+
+
+#//////////////////////////////////////////////////////////////////////////////#
+#
+# FIGURE 3. Rent-Burdened Households vs Deeply Affordable Units (New Construction), by Borough
+#
+#//////////////////////////////////////////////////////////////////////////////#
+
+#------------------------------ PREPARE DATA ----------------------------------#
+census_api_key("6a00d29884accc02aadc0242607ee52f88d6e504", install = FALSE)
+
+acs_burden <- get_acs(
+  geography = "county",
+  state     = "NY",
+  year      = 2021,
+  survey    = "acs5",
+  variables = c(
+    total       = "B25070_001",
+    pct_30_34   = "B25070_007",
+    pct_35_39   = "B25070_008",
+    pct_40_49   = "B25070_009",
+    pct_50_plus = "B25070_010"
+  ),
+  cache_table = TRUE
+) %>%
+  clean_names() %>%
+  select(name, variable, estimate) %>%
+  pivot_wider(names_from = variable, values_from = estimate) %>%
+  mutate(
+    borough_name = case_when(
+      name == "Bronx County, New York"      ~ "Bronx",
+      name == "Kings County, New York"      ~ "Brooklyn",
+      name == "New York County, New York"   ~ "Manhattan",
+      name == "Queens County, New York"     ~ "Queens",
+      name == "Richmond County, New York"   ~ "Staten Island"
+    ),
+    borough = factor(borough_name, levels = borough_levels),
+    rent_burdened_households =
+      replace_na(pct_30_34, 0) +
+      replace_na(pct_35_39, 0) +
+      replace_na(pct_40_49, 0) +
+      replace_na(pct_50_plus, 0)
+  ) %>%
+  select(borough, rent_burdened_households)
+
+deep_nc <- aff_housing %>%
+  filter(construction_type == "New Construction") %>%
+  group_by(borough) %>%
+  summarise(deep_units = sum(eli + vli, na.rm = TRUE), .groups = "drop")
+
+need_supply <- deep_nc %>% left_join(acs_burden, by = "borough")
+
+#------------------------------- CREATE FIGURE --------------------------------#
+# palette: distinct blues by borough
+blues_boros <- c(
+  "Bronx"         = "#0B3C6D",
+  "Brooklyn"      = "#2F5FA8",
+  "Manhattan"     = "#4379C3",
+  "Queens"        = "#6FA3E6",
+  "Staten Island" = "#9BBEF0"
+)
+
+# compute a scaling factor so the diagonal fits current axes
+max_x <- max(need_supply$rent_burdened_households, na.rm = TRUE)
+max_y <- max(need_supply$deep_units, na.rm = TRUE)
+slope_parity <- ifelse(max_x > 0, max_y / max_x, 0)   # scales the “need = units” line
+
+fig_03 <- ggplot(need_supply,
+                 aes(x = rent_burdened_households, y = deep_units, color = borough)) +
+  # perfect-alignment line (scaled)
+  geom_abline(intercept = 0, slope = slope_parity, linetype = "dashed", color = "grey60") +
+  # points
+  geom_point(size = 3.6) +
+  # borough labels
+  geom_text(aes(label = as.character(borough)), nudge_y = 450, size = 3.2,
+            color = deep_blue, show.legend = FALSE) +
+  # label the line
+  annotate("text",
+           x = 0.65 * max_x,
+           y = slope_parity * 0.65 * max_x,
+           label = "Perfect Alignment",
+           color = "grey40", size = 3.2, hjust = 0, vjust = -0.3) +
+  scale_color_manual(values = blues_boros, name = "Borough") +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(
+    title    = "Figure 3. Rent-Burdened Households vs Deeply Affordable Units, by Borough",
+    subtitle = "New Construction only. “Rent-burdened” = >30% of income on rent; “Deeply affordable” = ≤50% of AMI.",
+    x = "Rent-burdened renter households (ACS 5-year 2021)",
+    y = "Deeply affordable units (ELI + VLI)",
+    caption  = "Sources: U.S. Census Bureau (ACS Table B25070, 2017–2021); NYC Open Data — HPD Affordable Housing Production by Building. Last updated: August 28, 2025."
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor      = element_blank(),
+    plot.margin           = margin(t = 10, r = 24, b = 44, l = 24),  # more bottom space
+    plot.caption.position = "plot",
+    plot.caption          = element_text(margin = margin(t = 8)),
+    axis.title.x          = element_text(margin = margin(t = 12))
+  ) + title_style
+
+#------------------------------- SAVE FIGURE ----------------------------------#
+ggsave("fig_03_need_vs_supply_new_scatter.png",
+       fig_03, width = fig_w, height = fig_h, dpi = fig_dpi, bg = "white")
+
+
+#//////////////////////////////////////////////////////////////////////////////#
+#
+# FIGURE 4. New Construction vs Preservation, by Borough (Totals with % Mix)
+# Each borough shows two bars (New Construction, Preservation).
+# Bar height = total units since 2014;
+# inside labels show % ELI, % VLI, % >50% AMI.
+#
+#//////////////////////////////////////////////////////////////////////////////#
+
+
+#----------------------------------- PREPARE DATA -----------------------------#
+# Income stack order (bottom→top)
+income_levels <- c(
+  "Extremely Low Income (≤30% AMI)",   # bottom
+  "Very Low Income (31–50% AMI)",      # middle
+  "Other (>50% AMI)"                   # top
+)
+
+# Summarize totals and compute shares (ELI/VLI/Other) within each bar
+mix_boro_ct <- aff_housing %>%
+  filter(construction_type %in% c("New Construction","Preservation")) %>%
+  group_by(borough, construction_type) %>%
+  summarise(
+    units_total = sum(total_units, na.rm = TRUE),
+    eli_sum     = sum(eli, na.rm = TRUE),
+    vli_sum     = sum(vli, na.rm = TRUE),
+    other_sum   = sum(low + mod + mid + oth, na.rm = TRUE),
+    .groups     = "drop"
+  ) %>%
+  mutate(
+    mix_total = eli_sum + vli_sum + other_sum,
+    share_eli = if_else(mix_total > 0, eli_sum   / mix_total, 0),
+    share_vli = if_else(mix_total > 0, vli_sum   / mix_total, 0),
+    share_oth = if_else(mix_total > 0, other_sum / mix_total, 0),
+    # Convert shares to stacked units so bar height equals total units
+    units_eli = units_total * share_eli,
+    units_vli = units_total * share_vli,
+    units_oth = units_total * share_oth
+  ) %>%
+  pivot_longer(
+    c(units_eli, units_vli, units_oth),
+    names_to  = "bucket",
+    values_to = "units"
+  ) %>%
+  mutate(
+    # Renaming income buckets
+    income_bucket = case_when(
+      bucket == "units_eli" ~ "Extremely Low Income (≤30% AMI)",
+      bucket == "units_vli" ~ "Very Low Income (31–50% AMI)",
+      TRUE                  ~ "Other (>50% AMI)"
+    ),
+    income_bucket = factor(income_bucket, levels = income_levels),
+    # Inside % labels (we hide them for Staten Island as its bars are too small)
+    pct_label = case_when(
+      borough == "Staten Island" ~ NA_character_,
+      bucket  == "units_eli"     ~ paste0(round(100*share_eli), "%"),
+      bucket  == "units_vli"     ~ paste0(round(100*share_vli), "%"),
+      TRUE                       ~ paste0(round(100*share_oth), "%")
+    ),
+    # Facet label to create a visible gap between New Construction and Preservation
+    panel = construction_type
+  )
+
+# Split into two plotting data frames (so each gets its own legend block)
+mix_nc   <- mix_boro_ct %>% filter(construction_type == "New Construction")
+mix_pres <- mix_boro_ct %>% filter(construction_type == "Preservation")
+
+# Color mapping per legend block
+nc_colors   <- c("Extremely Low Income (≤30% AMI)" = deep_blue,
+                 "Very Low Income (31–50% AMI)"    = mid_blue,
+                 "Other (>50% AMI)"                = grey_fill)
+pres_colors <- c("Extremely Low Income (≤30% AMI)" = pres_green,
+                 "Very Low Income (31–50% AMI)"    = pres_green_lt,
+                 "Other (>50% AMI)"                = grey_fill)
+
+#---------------------- FACET SUBTITLES: CITYWIDE TOTALS ----------------------#
+# Adding "Total units: X" on the second line of each facet
+totals_by_type <- aff_housing %>%
+  filter(construction_type %in% c("New Construction","Preservation")) %>%
+  group_by(construction_type) %>%
+  summarise(total = sum(total_units, na.rm = TRUE))
+
+panel_labels <- c(
+  "New Construction" = paste0(
+    "New Construction\nTotal units: ",
+    scales::comma(totals_by_type$total[totals_by_type$construction_type=="New Construction"])
+  ),
+  "Preservation" = paste0(
+    "Preservation\nTotal units: ",
+    scales::comma(totals_by_type$total[totals_by_type$construction_type=="Preservation"])
+  )
+)
+
+#------------------------------- CREATE FIGURE --------------------------------#
+# We draw New Construction and Preservation in separate layers and reset the
+# fill scale between them to get two legend blocks with clear headings.
+# We use the package "ggnewscale" so that we can use more than one scale for
+# the same aesthetic in a single ggplot
+
+library(ggnewscale)
+
+# Adjusting axis: ensure a 100,000 tick shows
+y_top    <- max(mix_boro_ct$units_total, na.rm = TRUE)
+y_limit  <- max(100000, y_top * 1.05)              # cap to at least 100k
+y_breaks <- c(0, 25000, 50000, 75000, 100000)
+
+# For x-axis readability: we use two-letter borough codes BX/BK/MN/QN/SI
+mix_nc <- mix_nc %>%
+  mutate(borough_plot = forcats::fct_relevel(
+    forcats::fct_recode(borough,
+                        "BX" = "Bronx", "BK" = "Brooklyn", "MN" = "Manhattan",
+                        "QN" = "Queens", "SI" = "Staten Island"),
+    "BX","BK","MN","QN","SI"))
+
+mix_pres <- mix_pres %>%
+  mutate(borough_plot = forcats::fct_relevel(
+    forcats::fct_recode(borough,
+                        "BX" = "Bronx", "BK" = "Brooklyn", "MN" = "Manhattan",
+                        "QN" = "Queens", "SI" = "Staten Island"),
+    "BX","BK","MN","QN","SI"))
+
+fig_04 <- ggplot() +
+  # New Construction panel
+  geom_col(
+    data = mix_nc,
+    aes(x = borough_plot, y = units, fill = income_bucket),
+    width = 0.72, position = position_stack(reverse = TRUE)
+  ) +
+  geom_text(
+    data = mix_nc,
+    aes(x = borough_plot, y = units, label = pct_label),
+    position = position_stack(vjust = 0.5, reverse = TRUE),
+    color = label_white, size = 3.6, fontface = "bold", na.rm = TRUE
+  ) +
+  # Legend block for New Construction (first)
+  scale_fill_manual(
+    values = nc_colors,
+    name   = "New Construction — Income",
+    guide  = guide_legend(order = 1)
+  ) +
+  new_scale_fill() +
+  
+  # Preservation panel
+  geom_col(
+    data = mix_pres,
+    aes(x = borough_plot, y = units, fill = income_bucket),
+    width = 0.72, position = position_stack(reverse = TRUE)
+  ) +
+  geom_text(
+    data = mix_pres,
+    aes(x = borough_plot, y = units, label = pct_label),
+    position = position_stack(vjust = 0.5, reverse = TRUE),
+    color = label_white, size = 3.6, fontface = "bold", na.rm = TRUE
+  ) +
+  # Legend block for Preservation (second)
+  scale_fill_manual(
+    values = pres_colors,
+    name   = "Preservation — Income",
+    guide  = guide_legend(order = 2)
+  ) +
+  
+  # Facet to separate New Const vs Preservation (adds a visible gap between the two)
+  facet_grid(
+    ~ panel, scales = "free_x", space = "free_x",
+    labeller = labeller(panel = as_labeller(panel_labels))
+  ) +
+  
+  # Y-axis: force 100k tick and some headroom
+  scale_y_continuous(
+    limits = c(0, y_limit),
+    breaks = y_breaks,
+    labels = scales::comma,
+    expand = expansion(mult = c(0, 0.08))
+  ) +
+  labs(
+    title    = "Figure 4. New Construction vs Preservation, by Borough (Totals with % Mix)",
+    subtitle = "Bar height = total units since 2014; inside labels show % ELI, % VLI, % >50% AMI.",
+    x = "", y = "Number of units",
+    caption  = "Source: NYC Open Data — HPD Affordable Housing Production by Building. Last updated: August 28, 2025."
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.x   = element_blank(),
+    panel.grid.minor     = element_blank(),
+    axis.text.x          = element_text(size = 11),
+    plot.margin          = margin(t = 18, r = 20, b = 10, l = 20),
+    legend.position      = "right",
+    # More space between the two legend blocks
+    legend.spacing.y     = unit(10, "pt"),
+    legend.key.height    = unit(12, "pt"),
+    legend.box.spacing   = unit(10, "pt"),
+    # Facet headers: adding larger margins to push top labels down from title section
+    strip.text           = element_text(face = "bold", margin = margin(t = 18, b = 10)),
+    # Also adding extra space below subtitle to separate it from facet headers
+    plot.subtitle        = element_text(margin = margin(b = 24))
+  ) + title_style
+
+#------------------------------- SAVE FIGURE ----------------------------------#
+ggsave("fig_04_new_vs_pres_side_by_side_totals_plus_mix.png",
+       fig_04, width = fig_w, height = fig_h, dpi = fig_dpi, bg = "white")
+
+
+#//////////////////////////////////////////////////////////////////////////////#
+#
+# FIGURE 5. Affordable Housing Units per Year by Construction Type, by Borough
+# HPD-recorded units since 2014. Facets keep a common y-scale for fair comparison.
+#
+#//////////////////////////////////////////////////////////////////////////////#
+
+#------------------------------ PREPARE DATA ----------------------------------#
+by_boro_year_type <- aff_housing %>%
+  filter(construction_type %in% c("New Construction","Preservation")) %>%
+  group_by(borough, year, construction_type) %>%
+  summarise(units = sum(total_units, na.rm = TRUE), .groups = "drop")
+
+#------------------------------- CREATE FIGURE --------------------------------#
+fig_05 <- ggplot(by_boro_year_type,
+                 aes(x = year, y = units, color = construction_type)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.8) +
+  geom_hline(yintercept = 0, color = "grey60", linewidth = 0.3) +
+  scale_color_manual(values = c("New Construction" = nc_blue,
+                                "Preservation"     = pres_green),
+                     name = "Construction type") +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.08))) +
+  labs(
+    title    = "Figure 5. Affordable Housing Units per Year by Construction Type, by Borough",
+    subtitle = "HPD-recorded affordable units since 2014",
+    x = "Year", y = "Number of units",
+    caption  = "Source: NYC Open Data — HPD Affordable Housing Production by Building. Last updated: August 28, 2025."
+  ) +
+  facet_wrap(~ borough, nrow = 2, scales = "fixed") +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.margin = margin(10, 20, 10, 20),
+    legend.position  = "bottom",
+    strip.text       = element_text(face = "bold"),
+    panel.spacing.y  = unit(2, "lines")
+  ) + title_style
+
+#------------------------------- SAVE FIGURE ----------------------------------#
+ggsave("fig_05_units_per_year_by_type_facet.png",
+       fig_05, width = fig_w, height = fig_h, dpi = fig_dpi, bg = "white")
+
+#------------------------------- END OF FILE ----------------------------------#
+

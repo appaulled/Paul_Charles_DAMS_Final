@@ -1,0 +1,419 @@
+#//////////////////////////////////////////////////////////////////////////////#
+# 
+# TITLE: Opportunity Zones vs Non-OZ in NYC (Citywide, CSV-only)
+# SUBTITLE: Pre/Post ACS rent burden; HPD new units (2018+), depth by income bracket
+# BY:    Charles Nkurunziza
+# DATE:  Dec 3, 2025
+#
+# OUTPUTS:
+#   Figure A — Rent burden slope (pre vs post) for OZ vs non-OZ (citywide)
+#   Figure B — Stacked bars: HPD new units since 2018 by income bracket (OZ vs non-OZ)
+#   Figure C — Need vs Supply scatter (tracts), color = OZ vs non-OZ (post-period)
+#   Table 1  — Summary table OZ vs non-OZ (N tracts, Δ burden, Δ median rent, units/1k HHs, deep share)
+#
+# REQUIRED CSV INPUTS (no shapefiles):
+#   1) nyc_oz_tracts.csv           -> one row per OZ tract, with a 'geoid' column (11-digit)
+#   2) HPD_buildings_with_tract.csv -> HPD buildings CSV with a 'geoid' column (from batch geocoder)
+#
+# Also uses ACS via tidycensus (tract level) for pre/post windows.
+#
+#//////////////////////////////////////////////////////////////////////////////#
+
+#------------------------------- PRE-ANALYSIS ---------------------------------#
+library(tidyverse)
+library(janitor)
+library(scales)
+library(tidycensus)
+library(lubridate)
+library(forcats)
+
+# Brand colors and sizes (reuse from your style)
+deep_blue    <- "#0B3C6D"
+mid_blue     <- "#4379C3"
+light_blue   <- "#6FA3E6"
+grey_fill    <- "#BFBFBF"
+nc_blue      <- "#2F5FA8"
+pres_green   <- "#3B8F6A"
+pres_green_lt<- "#6DBB9A"
+label_white  <- "white"
+
+fig_w  <- 11
+fig_h  <- 6.5
+fig_dpi <- 300
+
+title_style <- theme(
+  plot.title    = element_text(hjust = 0.5, face = "bold", color = deep_blue,
+                               size = 16, margin = margin(b = 6)),
+  plot.subtitle = element_text(hjust = 0.5, size = 11, margin = margin(b = 10)),
+  plot.title.position = "plot"
+)
+
+#------------------------------ CONFIG / KEYS ---------------------------------#
+# We use two ACS 5-year windows: Pre = 2013–2017 (year=2017) and Post = 2019–2023 (year=2023)
+pre_year  <- 2017
+post_year <- 2023
+
+# IMPORTANT: add your Census API key (or ensure it's installed already)
+# census_api_key("YOUR_KEY_HERE", install = FALSE)
+
+#------------------------------ LOAD OZ TRACTS --------------------------------#
+# This is the simple list of OZ tracts in NYC; must include 'geoid' (11-digit).
+oz_tracts <- read_csv("nyc_oz_tracts.csv", show_col_types = FALSE) %>%
+  clean_names() %>%
+  mutate(geoid = as.character(geoid)) %>%
+  distinct(geoid) %>%
+  mutate(is_oz = TRUE)
+
+#------------------------------ LOAD HPD CSV ----------------------------------#
+# HPD with tract GEOIDs added via the Census Batch Geocoder (see prep steps).
+# If you don't have this yet, the script will still run (Figure A + Table 1 partial).
+hpd_path <- "HPD_buildings_with_tract.csv"
+has_hpd  <- file.exists(hpd_path)
+
+if (has_hpd) {
+  hpd <- read_csv(hpd_path, show_col_types = FALSE) %>%
+    clean_names() %>%
+    mutate(
+      geoid = as.character(geoid),
+      reporting_construction_type = coalesce(reporting_construction_type, reporting_construction_type), # keep name stable
+      # Try to standardize a completion date field if available
+      completion_date = coalesce(ymd(project_completion_date), ymd(building_completion_date), ymd(project_start_date)),
+      year = year(completion_date),
+      # Income buckets (same mapping as before)
+      eli = replace_na(extremely_low_income_units, 0),
+      vli = replace_na(very_low_income_units, 0),
+      low = replace_na(low_income_units, 0),
+      mod = replace_na(moderate_income_units, 0),
+      mid = replace_na(middle_income_units, 0),
+      oth = replace_na(other_income_units, 0),
+      total_units = replace_na(total_units, 0)
+    )
+} else {
+  message("HPD_buildings_with_tract.csv not found. Figure B / C will be skipped; Table 1 will omit new-unit metrics.")
+}
+
+#--------------------------- HELPERS: ACS WRAPPERS ----------------------------#
+# We fetch ACS tract-level metrics for NYC across both windows (pre/post).
+# Tables used:
+#   - B25070: Rent as % of HH income (renter HHs by burden buckets)
+#   - B25064: Median gross rent
+#   - B25003: Tenure (to count renter HHs if needed in denominators)
+
+nyc_counties <- c("005","047","061","081","085") # Bronx, Brooklyn, Manhattan, Queens, Staten Island
+state_fips   <- "36"                              # New York
+
+get_acs_tract <- function(year, vars) {
+  get_acs(
+    geography = "tract",
+    state     = state_fips,
+    county    = nyc_counties,
+    year      = year,
+    survey    = "acs5",
+    variables = vars,
+    cache_table = TRUE,
+    output   = "wide"   # wide = each var becomes its own _E / _M columns
+  ) %>%
+    clean_names() %>%
+    rename(geoid = geoid) %>%
+    mutate(geoid = as.character(geoid))
+}
+
+#------------------------------ ACS: PRE & POST -------------------------------#
+# Rent burden buckets (B25070):
+#  - total renters: B25070_001E
+#  - 30-34%:  B25070_007E
+#  - 35-39%:  B25070_008E
+#  - 40-49%:  B25070_009E
+#  - 50%+:    B25070_010E
+rb_vars <- c(
+  total     = "B25070_001",
+  p30_34    = "B25070_007",
+  p35_39    = "B25070_008",
+  p40_49    = "B25070_009",
+  p50_plus  = "B25070_010"
+)
+
+# Median gross rent (B25064_001E)
+rent_vars <- c(med_gross_rent = "B25064_001")
+
+# Tenure (B25003) – renter-occupied denom if needed (B25003_003E)
+tenure_vars <- c(owner = "B25003_002", renter = "B25003_003")
+
+acs_pre  <- get_acs_tract(pre_year,  c(rb_vars, rent_vars, tenure_vars))
+acs_post <- get_acs_tract(post_year, c(rb_vars, rent_vars, tenure_vars))
+
+# Compute rent-burden rate and keep median rent + renter HHs
+prep_acs <- function(df) {
+  df %>%
+    transmute(
+      geoid,
+      rb_total  = b25070_001e,
+      rb_30_34  = b25070_007e,
+      rb_35_39  = b25070_008e,
+      rb_40_49  = b25070_009e,
+      rb_50p    = b25070_010e,
+      # burdened (>=30%) count
+      rb_burden_cnt = replace_na(rb_30_34,0) + replace_na(rb_35_39,0) +
+        replace_na(rb_40_49,0) + replace_na(rb_50p,0),
+      rent_burden_rate = if_else(rb_total > 0, rb_burden_cnt / rb_total, NA_real_),
+      median_rent      = b25064_001e,
+      renter_hhs       = b25003_003e
+    )
+}
+
+acs_pre_m  <- prep_acs(acs_pre)  %>% rename(rent_burden_pre = rent_burden_rate,
+                                            median_rent_pre = median_rent,
+                                            renter_hhs_pre  = renter_hhs)
+acs_post_m <- prep_acs(acs_post) %>% rename(rent_burden_post = rent_burden_rate,
+                                            median_rent_post = median_rent,
+                                            renter_hhs_post  = renter_hhs)
+
+# Merge pre/post and flag OZs
+tract_panel <- acs_pre_m %>%
+  full_join(acs_post_m, by = "geoid") %>%
+  left_join(oz_tracts, by = "geoid") %>%
+  mutate(is_oz = replace_na(is_oz, FALSE))
+
+#//////////////////////////////////////////////////////////////////////////////#
+#
+# FIGURE A. Rent burden slope (pre vs post), OZ vs non-OZ (citywide)
+# Shows average rent-burdened share in OZ vs non-OZ tracts for two ACS windows.
+#
+#//////////////////////////////////////////////////////////////////////////////#
+
+#------------------------------ PREPARE DATA ----------------------------------#
+figA_df <- tract_panel %>%
+  group_by(is_oz) %>%
+  summarise(
+    rent_burden_pre  = mean(rent_burden_pre,  na.rm = TRUE),
+    rent_burden_post = mean(rent_burden_post, na.rm = TRUE),
+    n_tracts         = n(),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(c(rent_burden_pre, rent_burden_post),
+               names_to = "period", values_to = "rb_rate") %>%
+  mutate(period = recode(period,
+                         rent_burden_pre = paste0("Pre (", pre_year-4,"–", pre_year,")"),
+                         rent_burden_post= paste0("Post (", post_year-4,"–", post_year,")")),
+         group = if_else(is_oz, "OZ tracts", "Non-OZ tracts"))
+
+#------------------------------- CREATE FIGURE --------------------------------#
+fig_A <- ggplot(figA_df, aes(x = period, y = rb_rate, group = group, color = group)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_color_manual(values = c("OZ tracts" = deep_blue, "Non-OZ tracts" = mid_blue), name = "") +
+  labs(
+    title    = "Figure A. Rent Burden (Pre vs Post), Opportunity Zones vs Non-OZ (NYC tracts)",
+    subtitle = "Average share of renter households spending ≥30% of income on rent.\nPre = ACS 2013–2017; Post = ACS 2019–2023.",
+    x = "", y = "Rent-burdened share",
+    caption  = "Source: U.S. Census Bureau (ACS 5-year, Tables B25070, B25064, B25003)."
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position  = "bottom",
+    plot.margin      = margin(10, 20, 10, 20)
+  ) + title_style
+
+ggsave("fig_A_rent_burden_slope_oz_vs_nonoz.png",
+       fig_A, width = fig_w, height = fig_h, dpi = fig_dpi, bg = "white")
+
+#//////////////////////////////////////////////////////////////////////////////#
+#
+# FIGURE B. New “affordable” units since 2018 by income bracket (OZ vs Non-OZ)
+# Requires HPD_buildings_with_tract.csv with 'geoid'.
+#
+#//////////////////////////////////////////////////////////////////////////////#
+
+can_figB <- has_hpd && ("geoid" %in% names(hpd))
+
+if (can_figB) {
+  #------------------------------ PREPARE DATA --------------------------------
+  # Filter HPD to 2018+ completions, New Construction only; roll up by tract.
+  hpd_2018p <- hpd %>%
+    filter(!is.na(year), year >= 2018,
+           str_to_lower(reporting_construction_type) == "new construction",
+           !is.na(geoid) & nchar(geoid) == 11)
+  
+  # Join OZ flag at tract level
+  hpd_2018p <- hpd_2018p %>%
+    left_join(oz_tracts, by = "geoid") %>%
+    mutate(is_oz = replace_na(is_oz, FALSE))
+  
+  # Sum units by OZ group and income buckets
+  figB_stack <- hpd_2018p %>%
+    summarise(
+      eli = sum(eli, na.rm = TRUE),
+      vli = sum(vli, na.rm = TRUE),
+      oth = sum(low + mod + mid + oth, na.rm = TRUE),
+      .by = is_oz
+    ) %>%
+    mutate(group = if_else(is_oz, "OZ tracts", "Non-OZ tracts")) %>%
+    select(-is_oz) %>%
+    pivot_longer(c(eli, vli, oth), names_to = "bucket", values_to = "units") %>%
+    mutate(
+      income_bucket = case_when(
+        bucket == "eli" ~ "Extremely Low Income (≤30% AMI)",
+        bucket == "vli" ~ "Very Low Income (31–50% AMI)",
+        TRUE            ~ "Other (>50% AMI)"
+      ),
+      income_bucket = factor(income_bucket,
+                             levels = c("Extremely Low Income (≤30% AMI)",
+                                        "Very Low Income (31–50% AMI)",
+                                        "Other (>50% AMI)"))
+    ) %>%
+    group_by(group) %>%
+    mutate(total = sum(units, na.rm = TRUE),
+           share = if_else(total > 0, units/total, 0)) %>%
+    ungroup()
+  
+  #------------------------------- CREATE FIGURE ------------------------------
+  fig_B <- ggplot(figB_stack, aes(x = group, y = units, fill = income_bucket)) +
+    geom_col(width = 0.7, position = position_stack(reverse = TRUE)) +
+    geom_text(aes(label = paste0(round(100*share),"%")),
+              position = position_stack(vjust = 0.5, reverse = TRUE),
+              color = label_white, size = 3.8, fontface = "bold") +
+    scale_fill_manual(values = c(
+      "Extremely Low Income (≤30% AMI)" = deep_blue,
+      "Very Low Income (31–50% AMI)"    = mid_blue,
+      "Other (>50% AMI)"                = grey_fill
+    ), name = "Income Level") +
+    scale_y_continuous(labels = comma) +
+    labs(
+      title    = "Figure B. New Affordable Units Since 2018, by Income Bracket (OZ vs Non-OZ)",
+      subtitle = "New Construction only; labels show percent of total within each group.",
+      x = "", y = "Units (stack height = total since 2018)",
+      caption  = "Source: NYC Open Data (HPD Affordable Housing Production by Building, tract-joined via Census Batch Geocoder)."
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.grid.major.x = element_blank(),
+      legend.position = "right",
+      plot.margin = margin(10, 20, 10, 20)
+    ) + title_style
+  
+  ggsave("fig_B_new_units_2018p_stacked_oz_vs_nonoz.png",
+         fig_B, width = fig_w, height = fig_h, dpi = fig_dpi, bg = "white")
+} else {
+  message("Skipping Figure B (need HPD_buildings_with_tract.csv with a geoid column).")
+}
+
+#//////////////////////////////////////////////////////////////////////////////#
+#
+# FIGURE C. Need vs Supply (tracts; post window), color = OZ vs Non-OZ
+# X = rent burden (post); Y = new affordable units per 1,000 renter HHs since 2018.
+#
+#//////////////////////////////////////////////////////////////////////////////#
+
+can_figC <- can_figB  # same dependency (HPD by tract)
+
+if (can_figC) {
+  # Sum new units since 2018 by tract
+  units_by_tract <- hpd %>%
+    filter(!is.na(year), year >= 2018,
+           str_to_lower(reporting_construction_type) == "new construction",
+           !is.na(geoid) & nchar(geoid) == 11) %>%
+    group_by(geoid) %>%
+    summarise(new_units_2018p = sum(total_units, na.rm = TRUE),
+              deep_units_2018p = sum(eli + vli, na.rm = TRUE),
+              .groups = "drop")
+  
+  # Merge with post ACS for denominator + OZ flag
+  c_df <- tract_panel %>%
+    select(geoid, is_oz, rent_burden_post, renter_hhs_post) %>%
+    left_join(units_by_tract, by = "geoid") %>%
+    mutate(
+      new_units_2018p = replace_na(new_units_2018p, 0),
+      per_1000 = if_else(replace_na(renter_hhs_post,0) > 0,
+                         1000 * new_units_2018p / renter_hhs_post, NA_real_),
+      group = if_else(is_oz, "OZ tracts", "Non-OZ tracts")
+    )
+  
+  max_x <- max(c_df$rent_burden_post, na.rm = TRUE)
+  max_y <- max(c_df$per_1000, na.rm = TRUE)
+  slope  <- ifelse(max_x > 0, max_y/max_x, 0)
+  
+  fig_C <- ggplot(c_df, aes(x = rent_burden_post, y = per_1000, color = group)) +
+    geom_abline(intercept = 0, slope = slope, linetype = "dashed", color = "grey60") +
+    geom_point(alpha = 0.6) +
+    scale_x_continuous(labels = percent_format(accuracy = 1)) +
+    labs(
+      title    = "Figure C. Need vs Supply (Post): OZ vs Non-OZ NYC Tracts",
+      subtitle = "X = share of rent-burdened renter households (ACS 2019–2023). Y = New affordable units per 1,000 renter HHs (2018+).",
+      x = "Rent-burdened share (post window)", y = "New units per 1,000 renter HHs",
+      color = "",
+      caption  = "Sources: ACS 5-year; NYC Open Data (HPD Affordable Housing Production by Building)."
+    ) +
+    scale_color_manual(values = c("OZ tracts" = deep_blue, "Non-OZ tracts" = mid_blue)) +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.grid.minor = element_blank(),
+      legend.position = "bottom",
+      plot.margin = margin(10, 20, 10, 20)
+    ) + title_style
+  
+  ggsave("fig_C_need_vs_supply_scatter_oz_vs_nonoz.png",
+         fig_C, width = fig_w, height = fig_h, dpi = fig_dpi, bg = "white")
+} else {
+  message("Skipping Figure C (need HPD_buildings_with_tract.csv with a geoid column).")
+}
+
+#//////////////////////////////////////////////////////////////////////////////#
+#
+# TABLE 1. OZ vs Non-OZ summary (tract counts; Δ burden; Δ median rent; units/1k; deep share)
+#
+#//////////////////////////////////////////////////////////////////////////////#
+
+if (can_figB) {
+  # Build OZ/non-OZ aggregates for HPD (2018+)
+  hpd_grp <- hpd %>%
+    filter(!is.na(year), year >= 2018,
+           str_to_lower(reporting_construction_type) == "new construction",
+           !is.na(geoid) & nchar(geoid) == 11) %>%
+    left_join(oz_tracts, by = "geoid") %>%
+    mutate(is_oz = replace_na(is_oz, FALSE)) %>%
+    group_by(is_oz) %>%
+    summarise(
+      new_units_2018p = sum(total_units, na.rm = TRUE),
+      deep_units_2018p = sum(eli + vli, na.rm = TRUE),
+      .groups = "drop"
+    )
+} else {
+  hpd_grp <- tibble(is_oz = c(TRUE, FALSE),
+                    new_units_2018p = NA_real_,
+                    deep_units_2018p = NA_real_)
+}
+
+tab1 <- tract_panel %>%
+  mutate(group = if_else(is_oz, "OZ tracts", "Non-OZ tracts"),
+         d_rb  = rent_burden_post - rent_burden_pre,
+         d_rent= median_rent_post - median_rent_pre) %>%
+  group_by(group, is_oz) %>%
+  summarise(
+    tracts_n      = n(),
+    rb_pre        = mean(rent_burden_pre,  na.rm = TRUE),
+    rb_post       = mean(rent_burden_post, na.rm = TRUE),
+    rb_delta_pp   = (rb_post - rb_pre) * 100,           # percentage points
+    rent_pre      = mean(median_rent_pre,  na.rm = TRUE),
+    rent_post     = mean(median_rent_post, na.rm = TRUE),
+    rent_delta    = rent_post - rent_pre,
+    renter_hhs_post_sum = sum(replace_na(renter_hhs_post,0), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(hpd_grp, by = "is_oz") %>%
+  mutate(
+    units_per_1000 = if_else(renter_hhs_post_sum > 0,
+                             1000 * new_units_2018p / renter_hhs_post_sum, NA_real_),
+    deep_share     = if_else(replace_na(new_units_2018p,0) > 0,
+                             deep_units_2018p / new_units_2018p, NA_real_)
+  ) %>%
+  select(group, tracts_n,
+         rb_pre, rb_post, rb_delta_pp,
+         rent_pre, rent_post, rent_delta,
+         new_units_2018p, units_per_1000, deep_share) %>%
+  arrange(desc(group))
+
+# Save a clean CSV you can quote from in your text.
+write_csv(tab1, "table1_oz_vs_nonoz_summary.csv")
+print(tab1)

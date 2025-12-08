@@ -1,0 +1,204 @@
+#//////////////////////////////////////////////////////////////////////////////#
+# 
+# TITLE: Opportunity Zones — Tract-level Grouping
+# SUBTITLE: Build GEOIDs, join OZ list, pull ACS rent, and identify 3 OZ groups
+# BY:    Paul Lee & Charles Nkurunziza
+# DATE:  Dec 2025
+#
+#//////////////////////////////////////////////////////////////////////////////#
+
+#------------------------------- PRE-ANALYSIS ---------------------------------#
+library(tidyverse)
+library(janitor)
+library(stringr)
+library(lubridate)
+library(scales)
+library(tidycensus)
+
+#------------------------------ BRAND / PALETTE -------------------------------#
+# Use these everywhere; no inline hex codes below.
+deep_blue     <- "#0B3C6D"   # titles / deep-affordable fill
+mid_blue      <- "#4379C3"   # highlight points/lines
+light_blue    <- "#6FA3E6"   # light bars
+grey_fill     <- "#BFBFBF"   # other (>50% AMI)
+grey_line     <- "grey60"
+grey_text     <- "grey40"
+accent_red    <- "#D84A4A"   # flag points (high-dev, low-deep)
+label_white   <- "white"
+
+fig_w <- 11; fig_h <- 6.5; fig_dpi <- 300
+
+# Removing non-relevant tracts and defining cutoff share 
+min_units_threshold <- 10    # drop “park/airport” tracts from bottom list
+deep_cutoff_share   <- 0.25  # ≤25% of units at ≤50% AMI
+
+#------------------------------ LOAD OZ LIST ----------------------------------#
+oz_raw <- read_csv("designated-qozs.12.14.18.csv", show_col_types = FALSE) %>% clean_names()
+nyc_counties <- c("Bronx","Kings","New York","Queens","Richmond")
+
+oz_nyc <- oz_raw %>%
+  filter(state == "New York", county %in% nyc_counties) %>%
+  transmute(geoid = as.character(`census_tract_number`)) %>%
+  distinct()
+
+#------------------------------ LOAD HPD CSV ----------------------------------#
+hpd <- read_csv(
+  "Affordable_Housing_Production_by_Building.csv",
+  col_types = cols(
+    `Project Start Date`       = col_date("%m/%d/%Y"),
+    `Project Completion Date`  = col_date("%m/%d/%Y"),
+    `Building Completion Date` = col_date("%m/%d/%Y")
+  ),
+  show_col_types = FALSE
+) %>% clean_names()
+
+#-------------------------- BOROUGH → COUNTY FIPS -----------------------------#
+county_fips <- c(
+  "Bronx"         = "005",
+  "Brooklyn"      = "047",  # Kings
+  "Manhattan"     = "061",  # New York
+  "Queens"        = "081",
+  "Staten Island" = "085"   # Richmond
+)
+
+#--------------------------- MAKE 11-DIGIT GEOID ------------------------------#
+hpd <- hpd %>%
+  mutate(
+    county  = county_fips[as.character(borough)],
+    ct4     = str_pad(str_extract(as.character(census_tract), "\\d+"), 4, "left", "0"),
+    tract6  = if_else(is.na(ct4), NA_character_, paste0(ct4, "00")),
+    geoid   = if_else(!is.na(county) & !is.na(tract6), paste0("36", county, tract6), NA_character_)
+  )
+
+#--------------------------- BUILD HPD TRACT TOTALS ----------------------------#
+hpd_tract <- hpd %>%
+  mutate(
+    eli = replace_na(extremely_low_income_units, 0),
+    vli = replace_na(very_low_income_units, 0),
+    low = replace_na(low_income_units, 0),
+    mod = replace_na(moderate_income_units, 0),
+    mid = replace_na(middle_income_units, 0),
+    oth = replace_na(other_income_units, 0),
+    total_units = replace_na(total_units, 0)
+  ) %>%
+  group_by(geoid) %>%
+  summarise(
+    units_total = sum(total_units, na.rm = TRUE),
+    units_deep  = sum(eli + vli, na.rm = TRUE),
+    units_other = sum(low + mod + mid + oth, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+#------------------------------ PULL ACS RENT ---------------------------------#
+census_api_key("YOUR_CENSUS_API_KEY_HERE", install = FALSE)
+
+nyc_county_fips_vec <- c("005","047","061","081","085")
+
+acs_rent <- map_dfr(
+  nyc_county_fips_vec,
+  ~ get_acs(
+    geography = "tract",
+    state     = "36",
+    county    = .x,
+    year      = 2023,
+    survey    = "acs5",
+    variables = c(med_rent = "B25064_001"),
+    cache_table = TRUE
+  )
+) %>%
+  clean_names() %>%
+  select(geoid, med_rent = estimate)
+
+#------------------------------- MASTER FRAME ---------------------------------#
+oz_master <- hpd_tract %>%
+  full_join(oz_nyc %>% mutate(is_oz = TRUE), by = "geoid") %>%
+  mutate(is_oz = replace_na(is_oz, FALSE)) %>%
+  left_join(acs_rent, by = "geoid") %>%
+  mutate(deep_share = if_else(units_total > 0, units_deep / units_total, NA_real_))
+
+oz_only <- oz_master %>% filter(is_oz)
+oz_for_bottom <- oz_only %>% filter(units_total >= min_units_threshold | is.na(units_total))
+
+#------------------------- DEFINE THE THREE OZ GROUPS -------------------------#
+oz_top3 <- oz_only %>% arrange(desc(units_total)) %>% slice_head(n = 3)
+oz_bottom3 <- oz_for_bottom %>% arrange(units_total) %>% slice_head(n = 3)
+
+top_decile_cut <- quantile(oz_only$units_total %||% 0, probs = 0.90, na.rm = TRUE)
+
+oz_highdev_lowdeep <- oz_only %>%
+  filter(units_total >= top_decile_cut, !is.na(deep_share), deep_share <= deep_cutoff_share) %>%
+  arrange(units_total)
+
+#----------------------------- WRITE HELPER CSVs ------------------------------#
+write_csv(oz_top3,            "oz_top3_tracts.csv")
+write_csv(oz_bottom3,         "oz_bottom3_tracts.csv")
+write_csv(oz_highdev_lowdeep, "oz_highdev_lowdeep_tracts.csv")
+
+#------------------------------- THEME SNIPPET --------------------------------#
+title_style <- theme(
+  plot.title    = element_text(hjust = 0.5, face = "bold", color = deep_blue, size = 16, margin = margin(b = 6)),
+  plot.subtitle = element_text(hjust = 0.5, size = 11, margin = margin(b = 10)),
+  plot.title.position = "plot"
+)
+
+#//////////////////////////////////////////////////////////////////////////////#
+# FIGURE A — Top 3 OZ tracts (stack: deep vs other)
+#//////////////////////////////////////////////////////////////////////////////#
+fig_A <- oz_top3 %>%
+  pivot_longer(c(units_deep, units_other), names_to = "bucket", values_to = "units") %>%
+  mutate(bucket = recode(bucket, units_deep = "≤50% AMI (ELI+VLI)", units_other = ">50% AMI")) %>%
+  ggplot(aes(x = reorder(geoid, units_total), y = units, fill = bucket)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(y = units_total, label = comma(units_total)), vjust = -0.3, size = 3.6, color = deep_blue) +
+  scale_fill_manual(values = c("≤50% AMI (ELI+VLI)" = deep_blue, ">50% AMI" = grey_fill), name = "Income") +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, .08))) +
+  labs(title = "Top OZ Tracts by Total HPD Units (Citywide)",
+       subtitle = "Stacks show ≤50% AMI (ELI+VLI) vs >50% AMI since 2014.",
+       x = "Census Tract (GEOID)", y = "Units") +
+  theme_minimal(base_size = 12) + theme(panel.grid.major.x = element_blank()) + title_style
+
+ggsave("fig_A_top3_OZ_stacked.png", fig_A, width = fig_w, height = fig_h, dpi = fig_dpi, bg = "white")
+
+#//////////////////////////////////////////////////////////////////////////////#
+# FIGURE B — Bottom 3 OZ tracts (≥ threshold)
+#//////////////////////////////////////////////////////////////////////////////#
+fig_B <- oz_bottom3 %>%
+  ggplot(aes(x = reorder(geoid, units_total), y = units_total)) +
+  geom_col(fill = light_blue, width = 0.7) +
+  geom_text(aes(label = comma(units_total)), vjust = -0.3, size = 3.6, color = deep_blue) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, .08))) +
+  labs(title = paste0("Bottom OZ Tracts by Total HPD Units (≥ ", min_units_threshold, " units)"),
+       subtitle = "Citywide; excludes near-zero production tracts.",
+       x = "Census Tract (GEOID)", y = "Units") +
+  theme_minimal(base_size = 12) + theme(panel.grid.major.x = element_blank()) + title_style
+
+ggsave("fig_B_bottom3_OZ.png", fig_B, width = fig_w, height = fig_h, dpi = fig_dpi, bg = "white")
+
+#//////////////////////////////////////////////////////////////////////////////#
+# FIGURE C — High Development & Low Deep Share (OZ only)
+#//////////////////////////////////////////////////////////////////////////////#
+fig_C <- oz_only %>%
+  mutate(high_dev = units_total >= top_decile_cut,
+         low_deep = !is.na(deep_share) & deep_share <= deep_cutoff_share) %>%
+  ggplot(aes(x = units_total, y = deep_share)) +
+  geom_point(alpha = 0.25, size = 2.5, color = grey_fill) +
+  geom_point(data = subset(oz_only, units_total >= top_decile_cut),
+             aes(x = units_total, y = deep_share), size = 2.5, color = mid_blue) +
+  geom_point(data = oz_highdev_lowdeep,
+             aes(x = units_total, y = deep_share), size = 3.2, color = accent_red) +
+  geom_hline(yintercept = deep_cutoff_share, linetype = "dashed", color = grey_line) +
+  annotate("text",
+           x = max(oz_only$units_total, na.rm = TRUE)*0.65,
+           y = deep_cutoff_share + 0.012,
+           label = paste0("Low-deep cutoff = ", percent(deep_cutoff_share)),
+           color = grey_text, size = 3.2) +
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
+  labs(title = "High-Development OZ Tracts with Low Deep-Affordable Share",
+       subtitle = "Red points = flagged tracts (top decile by units AND ≤ cutoff at ≤50% AMI).",
+       x = "Total HPD units (since 2014)", y = "Deep-affordable share (ELI+VLI / total)") +
+  theme_minimal(base_size = 12) + title_style
+
+ggsave("fig_C_highdev_lowdeep_scatter.png", fig_C, width = fig_w, height = fig_h, dpi = fig_dpi, bg = "white")
+
+#------------------------------- END OF FILE ----------------------------------#

@@ -1,0 +1,198 @@
+#//////////////////////////////////////////////////////////////////////////////#
+# 
+# TITLE: OZ vs. Total Development
+# SUBTITLE: Comparing tract-level housing unit growth (ACS) to HPD affordable output
+# BY:    Charles Nkurunziza
+# DATE:  Dec 4, 2025
+#
+# FIGURES:
+#   A. Scatter: Tract housing-unit change (ACS) vs. HPD affordable units (2018–2023), OZ tracts
+#   B. Box/Bar: Affordable share of growth (aff_units / HU_change), OZ vs. non-OZ (citywide)
+#
+# DATA INPUTS (CSVs):
+#   - designated-qozs.12.14.18.csv   (must contain a column 'geoid' as 11-digit tract ID)
+#   - Affordable_Housing_Production_by_Building.csv
+#
+# NOTES:
+#   - ACS B25001 (Housing Units) is used as a proxy for total development over each 5-year pool.
+#   - We align HPD to the "post" ACS window (2019–2023) using completions 2018–2023 (approximate).
+#   - No shapefiles; everything is CSV + tidycensus.
+#
+#//////////////////////////////////////////////////////////////////////////////#
+
+#------------------------------- PRE-ANALYSIS ---------------------------------#
+library(tidyverse)
+library(janitor)
+library(scales)
+library(tidycensus)
+library(lubridate)
+
+# Branding (optional)
+deep_blue  <- "#0B3C6D"
+light_blue <- "#6FA3E6"
+grey_fill  <- "#BFBFBF"
+oz_blue    <- "#2F5FA8"
+nonoz_gray <- "#9FA8B2"
+
+fig_w  <- 11
+fig_h  <- 6.5
+fig_dpi <- 300
+
+title_style <- theme(
+  plot.title    = element_text(hjust = 0.5, face = "bold", color = deep_blue, size = 16,
+                               margin = margin(b = 6)),
+  plot.subtitle = element_text(hjust = 0.5, size = 11, margin = margin(b = 10)),
+  plot.title.position = "plot"
+)
+
+#------------------------------- LOAD OZ LIST ---------------------------------#
+# Expecting an 11-digit tract GEOID column named 'geoid' (you said you can rename it upstream).
+oz <- read_csv("designated-qozs.12.14.18.csv", show_col_types = FALSE) %>%
+  clean_names() %>%
+  rename(geoid = census_tract_number) %>%        # <- if your column is called Census Tract Number
+  mutate(geoid = str_pad(geoid, width = 11, side = "left", pad = "0")) %>%
+  distinct(geoid) %>%
+  mutate(is_oz = 1L)
+
+#------------------------------ LOAD & PREP HPD -------------------------------#
+# We build a tract GEOID from borough + 6-digit tract code ("tttt00").
+county_fips <- c("Bronx"="005","Brooklyn"="047","Manhattan"="061","Queens"="081","Staten Island"="085")
+
+hpd_raw <- read_csv(
+  "Affordable_Housing_Production_by_Building.csv",
+  col_types = cols(
+    `Project Start Date`       = col_date(format = "%m/%d/%Y"),
+    `Project Completion Date`  = col_date(format = "%m/%d/%Y"),
+    `Building Completion Date` = col_date(format = "%m/%d/%Y")
+  ),
+  show_col_types = FALSE
+) %>% clean_names()
+
+hpd <- hpd_raw %>%
+  mutate(
+    county  = county_fips[borough],
+    tract6  = if_else(is.na(census_tract), NA_character_,
+                      paste0(str_pad(as.character(census_tract), 4, "left", "0"), "00")),
+    geoid   = if_else(!is.na(county) & !is.na(tract6), paste0("36", county, tract6), NA_character_),
+    year_c  = year(building_completion_date),
+    # deep affordability buckets for optional ratios
+    eli = replace_na(extremely_low_income_units, 0),
+    vli = replace_na(very_low_income_units, 0),
+    total_units = replace_na(total_units, 0)
+  ) %>%
+  filter(!is.na(geoid))
+
+# For “post” ACS (2019–2023), approximate HPD window as 2018–2023 completions
+hpd_post <- hpd %>%
+  filter(!is.na(year_c), year_c >= 2018, year_c <= 2023) %>%
+  group_by(geoid) %>%
+  summarise(
+    aff_units_post = sum(total_units, na.rm = TRUE),
+    deep_units_post = sum(eli + vli, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+#------------------------------- GET ACS B25001 -------------------------------#
+census_api_key("6a00d29884accc02aadc0242607ee52f88d6e504", install = FALSE)
+
+get_hu <- function(yrs) {
+  get_acs(
+    geography = "tract", state = "NY", year = yrs, survey = "acs5",
+    variables = c(hu = "B25001_001"),
+    cache_table = TRUE
+  ) %>%
+    clean_names() %>%
+    transmute(geoid, hu = estimate)
+}
+
+hu_pre  <- get_hu(2017) %>% rename(hu_pre = hu)     # represents 2013–2017
+hu_post <- get_hu(2023) %>% rename(hu_post = hu)    # represents 2019–2023
+
+hu_change <- hu_pre %>%
+  inner_join(hu_post, by = "geoid") %>%
+  mutate(hu_change = hu_post - hu_pre)
+
+#---------------------------- JOIN OZ + HPD + ACS -----------------------------#
+df <- hu_change %>%
+  left_join(hpd_post, by = "geoid") %>%
+  left_join(oz, by = "geoid") %>%
+  mutate(
+    is_oz = replace_na(is_oz, 0L),
+    aff_units_post = replace_na(aff_units_post, 0),
+    deep_units_post = replace_na(deep_units_post, 0)
+  )
+
+# Optional: drop tracts with tiny/odd totals (parks/airports) from “bottom” logic
+df_use <- df %>%
+  mutate(valid_for_rank = hu_change >= 10)  # you can tighten/loosen this threshold
+
+#--------------------------- PICK YOUR 3 OZ GROUPS ----------------------------#
+# 1) Top 3 OZ tracts by total development (hu_change), using filter to valid tracts
+top3_oz <- df_use %>%
+  filter(is_oz == 1L, valid_for_rank) %>%
+  slice_max(order_by = hu_change, n = 3, with_ties = FALSE)
+
+# 2) Bottom 3 OZ tracts by total development (hu_change), excluding tiny/negative/suspect tracts
+bottom3_oz <- df_use %>%
+  filter(is_oz == 1L, valid_for_rank) %>%
+  slice_min(order_by = hu_change, n = 3, with_ties = FALSE)
+
+# 3) “High development, low affordable” OZs:
+#    Define “high development” as top 10% by hu_change; “low affordable” as aff share <= 25%.
+high_dev_cut <- quantile(df_use$hu_change[df_use$is_oz == 1L & df_use$valid_for_rank], 0.90, na.rm = TRUE)
+deep_share_cut <- 0.25
+
+hi_dev_low_aff <- df_use %>%
+  filter(is_oz == 1L, valid_for_rank,
+         hu_change >= high_dev_cut) %>%
+  mutate(aff_share_of_growth = if_else(hu_change > 0, aff_units_post / hu_change, NA_real_)) %>%
+  filter(!is.na(aff_share_of_growth), aff_share_of_growth <= deep_share_cut) %>%
+  slice_max(order_by = hu_change, n = 3, with_ties = FALSE)
+
+#------------------------------- QUICK FIGURES --------------------------------#
+# FIG A: Scatter — total development (ACS HU change) vs. HPD affordable units (post), OZ tracts only
+fig_a <- df %>%
+  filter(is_oz == 1L) %>%
+  ggplot(aes(x = hu_change, y = aff_units_post)) +
+  geom_hline(yintercept = 0, color = "grey85") +
+  geom_vline(xintercept = 0, color = "grey85") +
+  geom_point(color = oz_blue, alpha = 0.7, size = 2.2) +
+  labs(
+    title = "Figure A. In OZ Tracts: Total Housing-Unit Change vs. Affordable Units Added",
+    subtitle = "X: net change in housing units (ACS B25001, 2013–17 → 2019–23). Y: HPD-recorded affordable completions (2018–2023).",
+    x = "Net change in housing units (ACS)",
+    y = "HPD affordable units (completions 2018–2023)",
+    caption = "Sources: ACS 5-year (B25001), HPD Affordable Housing Production by Building, CDFI Opportunity Zones list."
+  ) +
+  theme_minimal(base_size = 12) + title_style
+
+ggsave("fig_a_oz_scatter_hu_change_vs_aff_units.png", fig_a, width = fig_w, height = fig_h, dpi = fig_dpi, bg = "white")
+
+# FIG B: Boxplot — affordable share of growth, OZ vs non-OZ (citywide)
+df_box <- df %>%
+  mutate(
+    group = if_else(is_oz == 1L, "OZ tracts", "Non-OZ tracts"),
+    aff_share_of_growth = if_else(hu_change > 0, aff_units_post / hu_change, NA_real_)
+  )
+
+fig_b <- df_box %>%
+  ggplot(aes(x = group, y = aff_share_of_growth, fill = group)) +
+  geom_hline(yintercept = 0, color = "grey85") +
+  geom_boxplot(alpha = 0.8, outlier.alpha = 0.4, width = 0.6) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_manual(values = c("OZ tracts" = oz_blue, "Non-OZ tracts" = nonoz_gray)) +
+  labs(
+    title = "Figure B. What Share of Growth Was 'Affordable'? OZ vs. Non-OZ Tracts",
+    subtitle = "Affordable share = HPD affordable completions (2018–2023) ÷ ACS housing-unit increase (2013–17 → 2019–23).",
+    x = "", y = "Affordable share of growth",
+    caption = "Notes: Share is undefined where ACS shows no growth or decline; those cases are omitted."
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none") + title_style
+
+ggsave("fig_b_aff_share_of_growth_oz_vs_nonoz.png", fig_b, width = fig_w, height = fig_h, dpi = fig_dpi, bg = "white")
+
+# Optional: print your three OZ groups for review
+top3_oz
+bottom3_oz
+hi_dev_low_aff

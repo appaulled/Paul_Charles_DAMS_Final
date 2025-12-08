@@ -1,0 +1,238 @@
+#//////////////////////////////////////////////////////////////////////////////#
+#
+# TITLE: Opportunity Zones — Post Snapshot
+# SUBTITLE: Total housing (ACS 2019–2023) vs. HPD affordable completions (2018–2023)
+# BY:    Charles Nkurunziza
+# DATE:  Dec 4, 2025
+#
+# FIGURES:
+#   A. Top 5 OZ tracts: stacked bars (Affordable vs. Other in total housing stock)
+#   B. Bottom 5 OZ tracts: stacked bars (excludes tiny/special tracts via a floor)
+#   C. “High total, low affordable” 5 OZ tracts: stacked bars
+#   D. Scatter (OZ citywide): total housing stock vs. HPD affordable units,
+#      colored by affordable-share cutoff (25%)
+#
+# DATA (CSVs, no shapefiles):
+#   - designated-qozs.12.14.18.csv   (must have 'geoid' 11-digit tract IDs; rename upstream if needed)
+#   - Affordable_Housing_Production_by_Building.csv
+#
+# RATIONALE:
+#   • “Total housing” uses ACS B25001 (Housing Units), 5-year 2019–2023 — a clean post snapshot.
+#   • “Affordable housing” uses HPD 'affordable' completions 2018–2023 to align roughly with the post pool.
+#   • Stacked bars show the composition: Affordable (HPD) vs “Other” (the remainder of ACS total).
+#   • Scatter adds a 25% affordable-share rule-of-thumb for quick visual triage.
+#
+#//////////////////////////////////////////////////////////////////////////////#
+
+#------------------------------- PRE-ANALYSIS ---------------------------------#
+library(tidyverse)
+library(janitor)
+library(scales)
+library(tidycensus)
+library(lubridate)
+library(stringr)
+
+#------------------------------- PARAMETERS -----------------------------------#
+AFF_SHARE_CUTOFF   <- 0.25   # 25% cutoff (scatter coloring + “low affordable” definition)
+BOTTOM_HU_MIN_FLOOR<- 500    # exclude very small/special tracts when picking the "bottom 5"
+HIGH_TOTAL_QUANT   <- 0.90   # “high total” = top 10% of ACS total housing stock among OZ tracts
+
+#------------------------------- BRANDING -------------------------------------#
+deep_blue  <- "#0B3C6D"  # titles + affordable (bars)
+light_blue <- "#6FA3E6"  # accents
+grey_fill  <- "#BFBFBF"  # “other” housing stack
+oz_blue    <- "#2F5FA8"  # dots with share >= cutoff
+low_red    <- "#D04A4A"  # dots with share < cutoff
+label_white<- "white"
+
+fig_w  <- 11
+fig_h  <- 6.5
+fig_dpi <- 300
+
+title_style <- theme(
+  plot.title    = element_text(hjust = 0.5, face = "bold", color = deep_blue,
+                               size = 16, margin = margin(b = 6)),
+  plot.subtitle = element_text(hjust = 0.5, size = 11, margin = margin(b = 10)),
+  plot.title.position = "plot"
+)
+
+#------------------------------- LOAD OZ LIST ---------------------------------#
+# Expecting an 11-digit tract GEOID column named 'geoid'.
+# If your file has "Census Tract Number", rename upstream or do it here:
+oz <- read_csv("designated-qozs.12.14.18.csv", show_col_types = FALSE) %>%
+  clean_names() %>%
+  rename(geoid = geoid) %>%               # <-- if already 'geoid', this is a no-op
+  mutate(geoid = str_pad(geoid, 11, "left", "0")) %>%
+  distinct(geoid) %>%
+  mutate(is_oz = 1L)
+
+#------------------------------ LOAD & PREP HPD -------------------------------#
+# Create an 11-digit tract GEOID once from Borough + Census Tract:
+# GEOID = "36" + County FIPS + (4-digit tract + "00")
+county_fips <- c(
+  "Bronx"         = "005",
+  "Brooklyn"      = "047",
+  "Manhattan"     = "061",
+  "Queens"        = "081",
+  "Staten Island" = "085"
+)
+
+hpd_raw <- read_csv(
+  "Affordable_Housing_Production_by_Building.csv",
+  col_types = cols(
+    `Project Start Date`       = col_date(format = "%m/%d/%Y"),
+    `Project Completion Date`  = col_date(format = "%m/%d/%Y"),
+    `Building Completion Date` = col_date(format = "%m/%d/%Y")
+  ),
+  show_col_types = FALSE
+) %>% clean_names()
+
+hpd <- hpd_raw %>%
+  mutate(
+    county  = county_fips[borough],
+    tract6  = if_else(is.na(census_tract), NA_character_,
+                      paste0(str_pad(as.character(census_tract), 4, "left", "0"), "00")),
+    geoid   = if_else(!is.na(county) & !is.na(tract6), paste0("36", county, tract6), NA_character_),
+    year_c  = year(building_completion_date),
+    total_units = replace_na(total_units, 0)
+  ) %>%
+  filter(!is.na(geoid))
+
+# “Post” HPD window aligned to ACS 2019–2023 (approximate): completions 2018–2023
+hpd_post <- hpd %>%
+  filter(!is.na(year_c), year_c >= 2018, year_c <= 2023) %>%
+  group_by(geoid) %>%
+  summarise(aff_units_post = sum(total_units, na.rm = TRUE), .groups = "drop")
+
+#------------------------------- GET ACS TOTAL --------------------------------#
+# Post snapshot of housing stock (B25001 Housing Units), 2019–2023
+census_api_key("6a00d29884accc02aadc0242607ee52f88d6e504", install = FALSE)
+
+acs_post <- get_acs(
+  geography = "tract", state = "NY", year = 2023, survey = "acs5",
+  variables = c(hu = "B25001_001"),
+  cache_table = TRUE
+) %>%
+  clean_names() %>%
+  transmute(geoid, hu_post = estimate)
+
+#---------------------------- JOIN & BUILD METRICS ----------------------------#
+df <- acs_post %>%
+  left_join(hpd_post, by = "geoid") %>%
+  left_join(oz, by = "geoid") %>%
+  mutate(
+    is_oz            = replace_na(is_oz, 0L),
+    aff_units_post   = replace_na(aff_units_post, 0),
+    other_units_post = pmax(hu_post - aff_units_post, 0),             # remainder of ACS total
+    aff_share_post   = if_else(hu_post > 0, aff_units_post / hu_post, NA_real_)
+  )
+
+#--------------------------- SELECT 3 × 5 OZ GROUPS ---------------------------#
+# 1) Top 5 OZs by total housing stock (post)
+top5_oz <- df %>%
+  filter(is_oz == 1L) %>%
+  arrange(desc(hu_post)) %>%
+  slice_head(n = 5) %>%
+  mutate(group = "Top 5 OZs (by total housing)")
+
+# 2) Bottom 5 OZs by total housing stock (post), excluding tiny/special tracts
+bottom5_oz <- df %>%
+  filter(is_oz == 1L, hu_post >= BOTTOM_HU_MIN_FLOOR) %>%  # floor avoids airports/parks/etc.
+  arrange(hu_post) %>%
+  slice_head(n = 5) %>%
+  mutate(group = "Bottom 5 OZs (post floor)")
+
+# 3) High total, low affordable (≥ 90th pct of total; affordable share ≤ 25%)
+hi_cut <- quantile(df$hu_post[df$is_oz == 1L], probs = HIGH_TOTAL_QUANT, na.rm = TRUE)
+
+hi_total_low_aff_5 <- df %>%
+  filter(is_oz == 1L, hu_post >= hi_cut, !is.na(aff_share_post), aff_share_post <= AFF_SHARE_CUTOFF) %>%
+  arrange(desc(hu_post)) %>%
+  slice_head(n = 5) %>%
+  mutate(group = "High total, low affordable (5)")
+
+# Combine for plotting
+sel15 <- bind_rows(top5_oz, bottom5_oz, hi_total_low_aff_5) %>%
+  mutate(geoid = factor(geoid, levels = geoid))  # keep order within each group
+
+#------------------------------ STACKED BAR DATA ------------------------------#
+bars <- sel15 %>%
+  select(geoid, group, aff_units_post, other_units_post, hu_post, aff_share_post) %>%
+  pivot_longer(
+    c(aff_units_post, other_units_post),
+    names_to = "bucket", values_to = "units"
+  ) %>%
+  mutate(bucket = recode(bucket,
+                         aff_units_post   = "Affordable (HPD 2018–2023)",
+                         other_units_post = "Other (ACS total minus HPD)"))
+
+#------------------------------- FIGURE A/B/C ---------------------------------#
+fig_bars <- ggplot(bars, aes(x = geoid, y = units, fill = bucket)) +
+  geom_col(width = 0.75) +
+  # inside % label: affordable share on the affordable stack only
+  geom_text(
+    data = bars %>% filter(bucket == "Affordable (HPD 2018–2023)"),
+    aes(label = paste0(round(100 * aff_share_post), "%")),
+    position = position_stack(vjust = 0.5),
+    color = label_white, size = 3.6, fontface = "bold", na.rm = TRUE
+  ) +
+  scale_fill_manual(
+    values = c("Affordable (HPD 2018–2023)" = deep_blue,
+               "Other (ACS total minus HPD)" = grey_fill),
+    name = NULL
+  ) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title    = "OZ Tracts — Total Housing (Post) vs. HPD Affordable (2018–2023)",
+    subtitle = "Stacked bars per tract (Affordable vs. Other). Panels show: Top 5, Bottom 5 (post floor), and High total + Low affordable.",
+    x = "Census tract (GEOID)", y = "Units (ACS total housing; affordable portion is HPD 2018–2023)",
+    caption  = "Sources: ACS 5-year 2019–2023 (B25001 Housing Units); HPD Affordable Housing Production by Building; CDFI OZ tract list."
+  ) +
+  facet_wrap(~ group, scales = "free_x", ncol = 1) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "right",
+    panel.grid.major.x = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) + title_style
+
+ggsave("fig_bars_oz_top_bottom_hightotal_lowaff.png", fig_bars,
+       width = fig_w, height = 1.25 * fig_h, dpi = fig_dpi, bg = "white")
+
+#--------------------------------- FIGURE D -----------------------------------#
+# Scatter (OZ citywide): total housing stock vs. HPD affordable units,
+# colored by whether affordable share meets the 25% cutoff.
+scatter_df <- df %>%
+  filter(is_oz == 1L) %>%
+  mutate(color_group = if_else(!is.na(aff_share_post) & aff_share_post < AFF_SHARE_CUTOFF,
+                               paste0("< ", percent(AFF_SHARE_CUTOFF)), paste0("≥ ", percent(AFF_SHARE_CUTOFF))))
+
+fig_scatter <- ggplot(scatter_df, aes(x = hu_post, y = aff_units_post, color = color_group)) +
+  geom_hline(yintercept = 0, color = "grey85") +
+  geom_vline(xintercept = 0, color = "grey85") +
+  geom_point(size = 2.2, alpha = 0.8) +
+  scale_color_manual(values = c(paste0("< ", percent(AFF_SHARE_CUTOFF)) = low_red,
+                                paste0("≥ ", percent(AFF_SHARE_CUTOFF)) = oz_blue),
+                     name = paste0("Affordable share (HPD/ACS) vs. ", percent(AFF_SHARE_CUTOFF))) +
+  scale_x_continuous(labels = comma) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title    = "OZ Tracts (Citywide): Total Housing Stock vs. HPD Affordable Units",
+    subtitle = "Color denotes whether the affordable share of total housing meets a 25% cutoff. Post snapshot only.",
+    x = "Total housing units (ACS 2019–2023, B25001)",
+    y = "HPD affordable units (completions 2018–2023)",
+    caption  = "Notes: ACS stock includes all tenure and eras; HPD counts only recorded affordable completions."
+  ) +
+  theme_minimal(base_size = 12) + title_style
+
+ggsave("fig_scatter_oz_share_cutoff_25.png", fig_scatter,
+       width = fig_w, height = fig_h, dpi = fig_dpi, bg = "white")
+
+#------------------------------- OPTIONAL: EXPORT -----------------------------#
+# Write the 15 selected tracts with their key metrics (useful for labels/maps later)
+sel15 %>%
+  arrange(group, desc(hu_post)) %>%
+  select(group, geoid, hu_post, aff_units_post, aff_share_post) %>%
+  write_csv("oz_selected_15_for_reference.csv")
+
+#------------------------------- END OF FILE ----------------------------------#

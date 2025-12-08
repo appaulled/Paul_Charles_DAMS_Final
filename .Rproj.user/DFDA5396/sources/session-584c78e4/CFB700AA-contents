@@ -1,0 +1,104 @@
+#//////////////////////////////////////////////////////////////////////////////#
+# TITLE: Minimal prep for OZ list (CSV) and HPD (CSV)
+# BY:    Charles Nkurunziza
+# DATE:  Dec 4, 2025
+# INPUTS:
+#   - designated-qozs.12.14.18.csv
+#   - Affordable_Housing_Production_by_Building.csv
+# OUTPUTS:
+#   - nyc_oz_tracts.csv
+#   - hpd_buildings_clean.csv
+#//////////////////////////////////////////////////////////////////////////////#
+
+library(tidyverse)
+library(janitor)
+library(lubridate)
+
+#-------------------------------- OZ TRACTS -----------------------------------#
+# Assumptions about the OZ CSV (after clean_names()):
+#   * state (e.g., "New York")
+#   * county (one of "Bronx","Kings","New York","Queens","Richmond")
+#   * a tract identifier in one of these columns:
+#       geoid  OR  census_tract_number_fips  OR  census_tract_fips  OR  census_tract_number  OR  census_tract
+# We’ll coalesce across them, keep all columns, and add a clean 11-digit `geoid`.
+
+oz_raw <- read_csv("designated-qozs.12.14.18.csv", show_col_types = FALSE) %>%
+  clean_names()
+
+oz_nyc <- oz_raw %>%
+  filter(state == "New York",
+         county %in% c("Bronx","Kings","New York","Queens","Richmond")) %>%
+  mutate(
+    # pick the first available tract id column, keep only digits, pad to 11
+    geoid_raw = coalesce(
+      as.character(geoid),
+      as.character(census_tract_number_fips),
+      as.character(census_tract_fips),
+      as.character(census_tract_number),
+      as.character(census_tract)
+    ),
+    geoid_digits = str_replace_all(geoid_raw, "[^0-9]", ""),
+    geoid = stringr::str_pad(geoid_digits, width = 11, side = "left", pad = "0")
+  ) %>%
+  # keep only rows that yielded a valid 11-digit tract
+  filter(nchar(geoid) == 11) %>%
+  # put geoid up front but KEEP every original column
+  relocate(geoid, .before = 1)
+
+write_csv(oz_nyc, "nyc_oz_tracts.csv", na = "")
+
+# quick glance
+oz_nyc %>% count(county, name = "oz_tracts") %>% arrange(county) %>% print()
+
+#---------------------------------- HPD ---------------------------------------#
+# Keep all columns. Light, safe parsing for dates & unit columns (do not drop originals).
+hpd_raw <- read_csv("Affordable_Housing_Production_by_Building.csv",
+                    guess_max = 200000, show_col_types = FALSE) %>%
+  clean_names()
+
+hpd <- hpd_raw %>%
+  mutate(
+    # parse common date fields if present (keep originals untouched)
+    project_start_date_dt        = suppressWarnings(mdy(project_start_date)),
+    project_completion_date_dt   = suppressWarnings(mdy(project_completion_date)),
+    building_completion_date_dt  = suppressWarnings(mdy(building_completion_date)),
+    year = coalesce(year(project_start_date_dt),
+                    year(project_completion_date_dt),
+                    year(building_completion_date_dt)),
+    # normalize construction type if a reporting field exists (don’t drop originals)
+    construction_type = coalesce(reporting_construction_type, construction_type),
+    # numeric helpers for income buckets (NA -> 0); originals remain
+    eli = as.numeric(replace_na(extremely_low_income_units, 0)),
+    vli = as.numeric(replace_na(very_low_income_units, 0)),
+    low = as.numeric(replace_na(low_income_units, 0)),
+    mod = as.numeric(replace_na(moderate_income_units, 0)),
+    mid = as.numeric(replace_na(middle_income_units, 0)),
+    oth = as.numeric(replace_na(other_income_units, 0)),
+    total_units = as.numeric(replace_na(total_units, 0))
+  )
+
+write_csv(hpd, "hpd_buildings_clean.csv", na = "")
+
+# light sanity checks (optional; print to console)
+hpd %>%
+  count(year, construction_type, name = "projects") %>%
+  arrange(year, construction_type) %>%
+  head(12) %>%
+  print()
+
+if ("borough" %in% names(hpd)) {
+  hpd %>% group_by(borough) %>%
+    summarise(units = sum(total_units, na.rm = TRUE), .groups = "drop") %>%
+    arrange(borough) %>% print()
+} else {
+  message("Note: HPD export has no 'borough' column — that’s OK.")
+}
+
+#-------------------------------- NEXT STEP -----------------------------------#
+# You do NOT need HPD_buildings_with_tract.csv yet.
+# Once you (or Paul) add tract GEOIDs to the HPD rows (outside R), save that file
+# with a 'geoid' column, then you can CSV-join to nyc_oz_tracts.csv to flag OZ vs non-OZ.
+# Example (later):
+#   hpd_geo  <- read_csv("HPD_buildings_with_tract.csv")
+#   oz_list  <- read_csv("nyc_oz_tracts.csv") %>% mutate(in_oz = TRUE) %>% select(geoid, in_oz)
+#   hpd_tag  <- hpd_geo %>% left_join(oz_list, by = "geoid") %>% mutate(in_oz = replace_na(in_oz, FALSE))
